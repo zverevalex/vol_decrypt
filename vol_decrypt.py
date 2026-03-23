@@ -193,7 +193,7 @@ def get_in_flight_moves():
     in_flight = []
     fields = "uuid,name,svm.name,movement.state,movement.percent_complete,movement.destination_aggregate"
     try:
-        for vol in Volume.get_collection(fields=fields, **{"movement.state": "!"}):
+        for vol in Volume.get_collection(fields=fields):
             vol.get(fields=fields)
             state = getattr(vol, "movement", None)
             if state is None:
@@ -227,7 +227,7 @@ def get_encrypted_volumes(svm_filter=None, exclude_volumes=None):
     fields = (
         "uuid,name,svm.name,size,style,"
         "encryption.enabled,encryption.type,encryption.state,"
-        "aggregates.name,aggregates.uuid,aggregates.node.name,"
+        "aggregates.name,aggregates.uuid,"
         "movement.state,space.used"
     )
     query = {
@@ -262,8 +262,9 @@ def get_encrypted_volumes(svm_filter=None, exclude_volumes=None):
 
         current_aggr = aggrs[0]
         current_aggr_name = current_aggr.name
-        current_node = getattr(current_aggr, "node", None)
-        current_node_name = current_node.name if current_node else None
+        # Node name is not available on the volumes endpoint;
+        # it will be resolved from the aggr_map at aggregate-selection time.
+        current_node_name = None
 
         space_used = 0
         sp = getattr(vol, "space", None)
@@ -304,6 +305,9 @@ def select_target_aggregate(vol_info, aggr_map, node_map, capacity_threshold):
         """Evaluate a list of aggregate names. Return best (name, projected_pct) or None."""
         best = None
         for aname in candidate_aggr_names:
+            # ONTAP rejects vol move to the same aggregate
+            if aname == current_aggr:
+                continue
             ainfo = aggr_map.get(aname)
             if ainfo is None:
                 continue
@@ -311,11 +315,7 @@ def select_target_aggregate(vol_info, aggr_map, node_map, capacity_threshold):
             if total == 0:
                 continue
 
-            # If moving to the same aggregate, no net space addition
-            if aname == current_aggr:
-                projected_used = ainfo["used"]
-            else:
-                projected_used = ainfo["used"] + vol_space
+            projected_used = ainfo["used"] + vol_space
 
             projected_pct = pct(projected_used, total)
             if projected_pct > capacity_threshold:
@@ -453,6 +453,12 @@ def run(args):
     # --- Discover encrypted volumes ---
     log.info("Discovering NVE-encrypted volumes...")
     encrypted_vols = get_encrypted_volumes(svm_filter=args.svm, exclude_volumes=args.exclude_volume)
+
+    # Resolve node names from aggr_map (not available on volumes endpoint)
+    for v in encrypted_vols:
+        ainfo = aggr_map.get(v["current_aggr"])
+        if ainfo:
+            v["current_node"] = ainfo["node_name"]
     if not encrypted_vols:
         log.info("No eligible encrypted volumes found. Nothing to do.")
         log.info("Run complete.")
