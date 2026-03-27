@@ -1,1 +1,10 @@
-netapp-ontap>=9.14
+apipkg==3.0.2
+certifi==2026.2.25
+charset-normalizer==3.4.6
+idna==3.11
+marshmallow==3.26.2
+netapp_ontap==9.18.1.0
+packaging==26.0
+requests==2.33.0
+requests-toolbelt==1.0.0
+urllib3==2.6.3
