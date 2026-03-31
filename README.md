@@ -156,6 +156,9 @@ python3 ontap_migrate.py cutover \
   --source-cluster 10.0.0.1 --source-username admin \
   --destination-cluster 10.0.0.2 --destination-username admin \
   --source-svm vs_prod --protocol cifs
+
+# Show tool version
+python3 ontap_migrate.py --version
 ```
 
 Passwords can be provided via `--source-password` / `--destination-password`,
@@ -175,6 +178,7 @@ or interactively at the prompt.
 | `--source-svm` | all | ✅ | — | Name of the source SVM |
 | `--destination-svm` | all | — | `<source-svm>_dst` | Name of the destination SVM |
 | `--protocol` | all | — | `cifs` | Protocol to migrate: `cifs`, `nfs`, or `both` |
+| `--log-file` | all | — | none | Optional log file path (console logging remains enabled) |
 | `--exclude-volumes` | replicate, collect | — | none | Volume name(s) to skip |
 
 ### Destination Volume Naming
@@ -218,6 +222,9 @@ created via a single `ExportPolicy.post` call including all rules.
 
 If a policy with the same name already exists on the destination SVM,
 it is **skipped** with a warning — no overwrite is performed.
+
+If a source export policy has no rules, policy reassign during cutover
+is skipped for that volume.
 
 ### Migration Progress Tracking
 

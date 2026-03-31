@@ -2,3 +2,6 @@
 __pycache__/
 logs/
 cutover_state.json
+
+.github/
+AGENTS.md

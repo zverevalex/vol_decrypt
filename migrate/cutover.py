@@ -1116,6 +1116,30 @@ class CutoverExecutor:
             self._nfs_policy_sync_done = True
         return self._nfs_policy_map
 
+    def _policy_has_rules(
+        self,
+        policy_name: str,
+        nfs_policies: list[NfsPolicyInfo] | None,
+    ) -> bool | None:
+        """Return whether a named NFS policy contains any export rules.
+
+        Args:
+            policy_name: Source policy name to inspect.
+            nfs_policies: Optional NFS policy definitions from state.
+
+        Returns:
+            bool | None: True if rules exist, False if policy exists but has
+                no rules, or None if no policy definition is available.
+        """
+        if not nfs_policies:
+            return None
+
+        for policy in nfs_policies:
+            if policy.source_policy_name == policy_name:
+                return bool(policy.rules)
+
+        return None
+
     def recreate_nfs_exports(
         self,
         volume_name: str,
@@ -1149,6 +1173,16 @@ class CutoverExecutor:
         volume_exports = [e for e in exports if e.volume_name == volume_name]
 
         for export in volume_exports:
+            has_rules = self._policy_has_rules(export.policy_name, nfs_policies)
+            if has_rules is False:
+                logging.info(
+                    "Skipping NFS export policy reassign for volume '%s' "
+                    "because source policy '%s' has no rules.",
+                    dst_vol_name,
+                    export.policy_name,
+                )
+                continue
+
             destination_policy_name = policy_map.get(
                 export.policy_name,
                 export.policy_name,

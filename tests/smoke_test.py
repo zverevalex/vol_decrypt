@@ -679,6 +679,36 @@ class TestCutoverExecutorNfsPolicyMigration(unittest.TestCase):
         self.assertEqual(dst_vol.nas, {"export_policy": {"name": "dst_pol"}})
         dst_vol.patch.assert_called_once()
 
+    def test_recreate_nfs_exports_skips_policy_without_rules(self) -> None:
+        """Policy reassign must be skipped when source policy has no rules."""
+        from migrate.cutover import ExportInfo, NfsPolicyInfo
+
+        executor = self._make_executor()
+        export_info = ExportInfo(policy_name="src_pol", volume_name="vol_data")
+        nfs_policies = [
+            NfsPolicyInfo(
+                source_policy_name="src_pol",
+                destination_policy_name="dst_pol",
+                rules=[],
+            )
+        ]
+
+        with (
+            patch.object(
+                executor,
+                "_ensure_nfs_policy_sync_once",
+                return_value={"src_pol": "dst_pol"},
+            ),
+            patch("migrate.cutover.Volume.get_collection") as get_collection_mock,
+        ):
+            executor.recreate_nfs_exports(
+                volume_name="vol_data",
+                exports=[export_info],
+                nfs_policies=nfs_policies,
+            )
+
+        get_collection_mock.assert_not_called()
+
 
 class TestCutoverExecutorSnapmirrorUpdate(unittest.TestCase):
     """Unit tests for final blocking SnapMirror update behavior."""
@@ -1081,6 +1111,19 @@ class TestParseArgs(unittest.TestCase):
         self.assertIn("vol_temp", args.exclude_volumes)
         self.assertIn("vol_scratch", args.exclude_volumes)
 
+    def test_log_file_parsed(self) -> None:
+        """--log-file must be accepted and stored in parsed args."""
+        args = self._parse("replicate", ["--log-file", "migration.log"])
+        self.assertEqual(args.log_file, "migration.log")
+
+    def test_version_flag_exits(self) -> None:
+        """--version must terminate parsing with exit code 0."""
+        from ontap_migrate import parse_args
+
+        with self.assertRaises(SystemExit) as ctx:
+            parse_args(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+
 
 # ---------------------------------------------------------------------------
 # ontap_migrate — OntapMigrate.run_cutover aborted path
@@ -1213,6 +1256,50 @@ class TestRunCutoverVolumeSelection(unittest.TestCase):
             junction_path = migrator._resolve_junction_path("vol_orphan")
 
         self.assertEqual(junction_path, f"/vol_orphan{DST_VOLUME_SUFFIX}")
+
+    def test_run_cutover_skips_when_no_volume_scope(self) -> None:
+        """run_cutover must stop early when no volume scope is available."""
+        from ontap_migrate import OntapMigrate, parse_args
+
+        state = {
+            "src_svm": "vs_prod",
+            "dst_svm": "vs_prod_dst",
+            "volume_names": [],
+            "cifs_shares": [],
+            "nfs_exports": [],
+            "nfs_policies": [],
+        }
+
+        argv = [
+            "cutover",
+            "--source-cluster",
+            "10.0.0.1",
+            "--source-username",
+            "admin",
+            "--destination-cluster",
+            "10.0.0.2",
+            "--destination-username",
+            "admin",
+            "--source-svm",
+            "vs_prod",
+        ]
+        with patch("migrate.snapmirror.getpass.getpass", return_value="pw"):
+            args = parse_args(argv)
+
+        with (
+            patch("ontap_migrate.load_cutover_state", return_value=state),
+            patch("ontap_migrate.CutoverExecutor") as executor_cls,
+            patch("builtins.input") as input_mock,
+        ):
+            migrator = OntapMigrate.__new__(OntapMigrate)
+            migrator._args = args
+            migrator._src_conn = MagicMock()
+            migrator._dst_conn = MagicMock()
+            migrator._state_path = Path("cutover_state.json")
+            migrator.run_cutover()
+
+        executor_cls.assert_not_called()
+        input_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

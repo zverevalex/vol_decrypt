@@ -1,41 +1,18 @@
 #!/usr/bin/env python3
-"""ontap_migrate.py — NetApp ONTAP Migration Entry Point.
+"""Run semi-automatic ONTAP migration workflows.
 
-Provides two subcommands that together implement a semi-automatic
-volume migration with SnapMirror as the data transport:
-
-  replicate   Discover source volumes, create unencrypted DP volumes on
-              the destination cluster, and establish SnapMirror
-              relationships in bulk.
-
-  collect     Read CIFS share / NFS export properties from the source
-              volumes and write a cutover state JSON file.
-
-  cutover     Load the cutover state, confirm with the operator, then
-              break SnapMirror, remount volumes, and re-create protocol
-              shares/exports on the destination.
-
-Usage examples:
-    python ontap_migrate.py replicate \\
-        --source-cluster 10.0.0.1 --source-username admin \\
-        --destination-cluster 10.0.0.2 --destination-username admin \\
-        --source-svm vs_prod --protocol cifs
-
-    python ontap_migrate.py collect \\
-        --source-cluster 10.0.0.1 --source-username admin \\
-        --destination-cluster 10.0.0.2 --destination-username admin \\
-        --source-svm vs_prod --protocol cifs
-
-    python ontap_migrate.py cutover \\
-        --source-cluster 10.0.0.1 --source-username admin \\
-        --destination-cluster 10.0.0.2 --destination-username admin \\
-        --source-svm vs_prod --protocol cifs
+Provides the `replicate`, `collect`, and `cutover` CLI subcommands that
+coordinate SnapMirror setup, protocol-state collection, and controlled
+cutover execution.
 """
 
 import argparse
+import getpass
 import logging
+import os
 import sys
 from pathlib import Path
+from typing import TypeAlias
 
 from netapp_ontap.resources import Volume as OntapVolume
 
@@ -59,7 +36,6 @@ from migrate.snapmirror import (
     ENV_DST_PASSWORD_VAR,
     ENV_SRC_PASSWORD_VAR,
     ReplicationContext,
-    _resolve_password,
     create_connection,
     create_snapmirror_relationships,
     ensure_destination_svm,
@@ -75,6 +51,95 @@ from migrate.snapmirror import (
 # ---------------------------------------------------------------------------
 
 _PROTOCOL_CHOICES = ("cifs", "nfs", "both")
+APP_VERSION = "1.0.1"
+__version__ = APP_VERSION
+__author__ = "Pascal Scheiben"
+__email__ = "pascal.scheiben@netapp.com"
+__copyright__ = "Copyright (c) NetApp Inc."
+
+CutoverInputs: TypeAlias = tuple[
+    str,
+    str,
+    list[ShareInfo],
+    list[ExportInfo],
+    list[NfsPolicyInfo],
+    set[str],
+]
+
+
+def resolve_password(
+    explicit: str | None,
+    env_var: str,
+    prompt_label: str,
+) -> str:
+    """Resolve a password from CLI argument, environment, or prompt.
+
+    Args:
+        explicit: Password provided directly by CLI argument.
+        env_var: Environment variable name to read when ``explicit`` is
+            not set.
+        prompt_label: Prompt text used for interactive password entry.
+
+    Returns:
+        str: Resolved password string.
+
+    Raises:
+        ValueError: If an interactive prompt returns an empty password.
+    """
+    if explicit:
+        return explicit
+
+    env_value = os.getenv(env_var)
+    if env_value:
+        return env_value
+
+    prompted = getpass.getpass(f"{prompt_label}: ")
+    if not prompted:
+        raise ValueError("Password must not be empty.")
+    return prompted
+
+
+def _enable_file_logging(log_file: str) -> None:
+    """Enable additional file logging on the root logger.
+
+    Args:
+        log_file: Path to the log file.
+
+    Returns:
+        None
+
+    Raises:
+        ValueError: If the parent directory does not exist.
+    """
+    log_path = Path(log_file).expanduser()
+    if log_path.parent != Path(".") and not log_path.parent.exists():
+        raise ValueError(f"Log directory does not exist: '{log_path.parent}'.")
+
+    root = logging.getLogger()
+
+    resolved_log_path = log_path.resolve()
+    for handler in root.handlers:
+        if not isinstance(handler, logging.FileHandler):
+            continue
+
+        existing_path = Path(handler.baseFilename).resolve()
+        if existing_path == resolved_log_path:
+            logging.debug(
+                "File logging already active for '%s'; skipping duplicate handler.",
+                resolved_log_path,
+            )
+            return
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+
+    logging.info("File logging enabled: '%s'.", log_path)
 
 
 def _build_common_parser(subparser: argparse.ArgumentParser) -> None:
@@ -140,22 +205,31 @@ def _build_common_parser(subparser: argparse.ArgumentParser) -> None:
         default="cifs",
         help="Protocol to migrate (cifs, nfs, or both). Defaults to cifs.",
     )
+    subparser.add_argument(
+        "--log-file",
+        default=None,
+        help=(
+            "Optional path to a log file. When set, logs are written to "
+            "console and file."
+        ),
+    )
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse top-level arguments and subcommand arguments.
-
-    Args:
-        argv: Optional argument list. Defaults to sys.argv when None.
+def _build_parser() -> argparse.ArgumentParser:
+    """Create and return the top-level CLI parser.
 
     Returns:
-        argparse.Namespace: Parsed arguments with resolved passwords and
-            default destination SVM name.
+        argparse.ArgumentParser: Fully configured argument parser.
     """
     parser = argparse.ArgumentParser(
         prog="ontap_migrate",
         description="Semi-automatic ONTAP volume migration via SnapMirror.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {APP_VERSION}",
     )
     subparsers = parser.add_subparsers(
         dest="command",
@@ -163,7 +237,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
     )
 
-    # -- replicate ----------------------------------------------------------
     replicate_parser = subparsers.add_parser(
         "replicate",
         help="Create DP volumes and SnapMirror relationships.",
@@ -177,7 +250,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Volume name(s) to exclude from replication.",
     )
 
-    # -- collect ------------------------------------------------------------
     collect_parser = subparsers.add_parser(
         "collect",
         help="Read share/export properties and write cutover state JSON.",
@@ -191,25 +263,30 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Volume name(s) to exclude from collection.",
     )
 
-    # -- cutover ------------------------------------------------------------
     cutover_parser = subparsers.add_parser(
         "cutover",
         help="Execute the confirmed cutover from source to destination.",
     )
     _build_common_parser(cutover_parser)
 
-    args = parser.parse_args(argv)
+    return parser
 
-    # Resolve passwords
-    args.source_password = _resolve_password(
+
+def _resolve_credentials(args: argparse.Namespace) -> None:
+    """Resolve source/destination passwords for parsed arguments.
+
+    Args:
+        args: Parsed CLI arguments to update in place.
+
+    Returns:
+        None
+    """
+    args.source_password = resolve_password(
         explicit=args.source_password,
         env_var=ENV_SRC_PASSWORD_VAR,
         prompt_label=f"Password for {args.source_username}@{args.source_cluster}",
     )
 
-    # When source and destination cluster are the same host, reuse the
-    # source credentials so the operator is not prompted twice for the
-    # same password.
     same_cluster = (
         args.source_cluster.strip().lower() == args.destination_cluster.strip().lower()
     )
@@ -221,18 +298,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
         args.destination_username = args.source_username
         args.destination_password = args.source_password
-    else:
-        args.destination_password = _resolve_password(
-            explicit=args.destination_password,
-            env_var=ENV_DST_PASSWORD_VAR,
-            prompt_label=(
-                f"Password for {args.destination_username}@{args.destination_cluster}"
-            ),
-        )
+        return
 
-    # Default destination SVM
+    args.destination_password = resolve_password(
+        explicit=args.destination_password,
+        env_var=ENV_DST_PASSWORD_VAR,
+        prompt_label=(
+            f"Password for {args.destination_username}@{args.destination_cluster}"
+        ),
+    )
+
+
+def _apply_cli_defaults(args: argparse.Namespace) -> None:
+    """Apply CLI defaults that depend on parsed values.
+
+    Args:
+        args: Parsed CLI arguments to update in place.
+
+    Returns:
+        None
+    """
     if args.destination_svm is None:
         args.destination_svm = f"{args.source_svm}{DST_SVM_SUFFIX}"
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse top-level arguments and subcommand arguments.
+
+    Args:
+        argv: Optional argument list. Defaults to sys.argv when None.
+
+    Returns:
+        argparse.Namespace: Parsed arguments with resolved passwords and
+            default destination SVM name.
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    _resolve_credentials(args)
+    _apply_cli_defaults(args)
 
     return args
 
@@ -391,19 +494,43 @@ class OntapMigrate:
     # cutover
     # ------------------------------------------------------------------
 
-    def run_cutover(self) -> None:
-        """Execute the operator-confirmed cutover sequence.
+    @staticmethod
+    def _determine_cutover_volume_names(
+        raw_volume_names: list[str],
+        shares: list[ShareInfo],
+        exports: list[ExportInfo],
+    ) -> set[str]:
+        """Build the set of volume names to process during cutover.
 
-        Loads the cutover state file, displays a summary of changes,
-        waits for explicit confirmation, then runs the CutoverExecutor
-        for each volume in the state.
+        Uses explicit ``volume_names`` from state as primary source and
+        falls back to legacy CIFS/NFS entries when missing.
+
+        Args:
+            raw_volume_names: Raw volume list from state.
+            shares: Parsed CIFS share entries.
+            exports: Parsed NFS export entries.
 
         Returns:
-            None
+            set[str]: Unique volume names for cutover execution.
+        """
+        all_volume_names = {
+            str(volume_name) for volume_name in raw_volume_names if str(volume_name)
+        }
+        if all_volume_names:
+            return all_volume_names
 
-        Raises:
-            FileNotFoundError: If the cutover state file does not exist.
-            RuntimeError: If any cutover step fails.
+        vol_names_from_shares = {s.volume_name for s in shares if s.volume_name}
+        vol_names_from_exports = {e.volume_name for e in exports if e.volume_name}
+        return vol_names_from_shares | vol_names_from_exports
+
+    def _load_cutover_inputs(
+        self,
+    ) -> CutoverInputs:
+        """Load state and deserialize all cutover inputs.
+
+        Returns:
+            CutoverInputs: Parsed source/destination SVM names,
+                protocol data, and cutover volume scope.
         """
         state: CutoverStateMap = load_cutover_state(self._state_path)
 
@@ -424,7 +551,7 @@ class OntapMigrate:
             )
             for share in raw_shares
         ]
-        exports = [ExportInfo(**e) for e in raw_exports]
+        exports = [ExportInfo(**exp) for exp in raw_exports]
         nfs_policies = [
             NfsPolicyInfo(
                 source_policy_name=str(policy.get("source_policy_name", "")),
@@ -433,16 +560,110 @@ class OntapMigrate:
             )
             for policy in raw_nfs_policies
         ]
-
-        self._print_cutover_summary(src_svm, dst_svm, shares, exports)
-
-        answer = (
-            input("\nProceed with cutover? This action is irreversible. [yes/no]: ")
-            .strip()
-            .lower()
+        all_volume_names = self._determine_cutover_volume_names(
+            raw_volume_names,
+            shares,
+            exports,
         )
-        if answer != "yes":
-            logging.info("Cutover aborted by operator.")
+
+        return (
+            src_svm,
+            dst_svm,
+            shares,
+            exports,
+            nfs_policies,
+            all_volume_names,
+        )
+
+    @staticmethod
+    def _confirm_cutover() -> bool:
+        """Prompt for explicit cutover confirmation.
+
+        Returns:
+            bool: True if operator confirms with ``yes``, otherwise False.
+        """
+        answer = (
+            input("\nType 'yes' to start cutover now (irreversible): ").strip().lower()
+        )
+        if answer == "yes":
+            return True
+
+        logging.info(
+            "Cutover aborted by operator (input: '%s').",
+            answer or "<empty>",
+        )
+        return False
+
+    def _execute_cutover_scope(
+        self,
+        executor: CutoverExecutor,
+        volume_names: set[str],
+        shares: list[ShareInfo],
+        exports: list[ExportInfo],
+        nfs_policies: list[NfsPolicyInfo],
+    ) -> None:
+        """Execute cutover for each volume in the given scope.
+
+        Args:
+            executor: Prepared cutover executor instance.
+            volume_names: Volumes to process.
+            shares: CIFS share definitions.
+            exports: NFS export definitions.
+            nfs_policies: NFS policy/rule definitions.
+
+        Returns:
+            None
+        """
+        for vol_name in sorted(volume_names):
+            junction_path = self._resolve_junction_path(vol_name)
+            executor.execute(
+                volume_name=vol_name,
+                junction_path=junction_path,
+                shares=shares,
+                exports=exports,
+                protocol=self._args.protocol,
+                nfs_policies=nfs_policies,
+            )
+
+    def run_cutover(self) -> None:
+        """Execute the operator-confirmed cutover sequence.
+
+        Loads the cutover state file, displays a summary of changes,
+        waits for explicit confirmation, then runs the CutoverExecutor
+        for each volume in the state.
+
+        Returns:
+            None
+
+        Raises:
+            FileNotFoundError: If the cutover state file does not exist.
+            RuntimeError: If any cutover step fails.
+        """
+        (
+            src_svm,
+            dst_svm,
+            shares,
+            exports,
+            nfs_policies,
+            all_volume_names,
+        ) = self._load_cutover_inputs()
+
+        self._log_cutover_summary(
+            src_svm,
+            dst_svm,
+            shares,
+            exports,
+            sorted(all_volume_names),
+        )
+
+        if not all_volume_names:
+            logging.warning(
+                "No volumes found in cutover state. Nothing to do. "
+                "Run 'collect' again if this is unexpected."
+            )
+            return
+
+        if not self._confirm_cutover():
             return
 
         executor = CutoverExecutor(
@@ -453,25 +674,13 @@ class OntapMigrate:
             state_path=self._state_path,
         )
 
-        all_volume_names = {
-            str(volume_name) for volume_name in raw_volume_names if str(volume_name)
-        }
-        if not all_volume_names:
-            # Legacy fallback for state files without explicit volume_names.
-            vol_names_from_shares = {s.volume_name for s in shares if s.volume_name}
-            vol_names_from_exports = {e.volume_name for e in exports if e.volume_name}
-            all_volume_names = vol_names_from_shares | vol_names_from_exports
-
-        for vol_name in sorted(all_volume_names):
-            junction_path = self._resolve_junction_path(vol_name)
-            executor.execute(
-                volume_name=vol_name,
-                junction_path=junction_path,
-                shares=shares,
-                exports=exports,
-                protocol=self._args.protocol,
-                nfs_policies=nfs_policies,
-            )
+        self._execute_cutover_scope(
+            executor,
+            all_volume_names,
+            shares,
+            exports,
+            nfs_policies,
+        )
 
         logging.info("All cutover operations completed successfully.")
 
@@ -513,46 +722,63 @@ class OntapMigrate:
         return f"{src_path.rstrip('/')}{DST_VOLUME_SUFFIX}"
 
     @staticmethod
-    def _print_cutover_summary(
+    def _log_cutover_summary(
         src_svm: str,
         dst_svm: str,
         shares: list[ShareInfo],
         exports: list[ExportInfo],
+        volume_names: list[str],
     ) -> None:
-        """Print a human-readable summary of the planned cutover actions.
+        """Log a human-readable summary of planned cutover actions.
 
         Args:
             src_svm: Name of the source SVM.
             dst_svm: Name of the destination SVM.
             shares: List of CIFS shares to be recreated.
             exports: List of NFS exports to be reassigned.
+            volume_names: Explicit list of volumes planned for cutover.
 
         Returns:
             None
         """
+        lines: list[str] = [
+            "=" * 60,
+            "  CUTOVER PLAN SUMMARY",
+            "=" * 60,
+            f"  Source SVM      : {src_svm}",
+            f"  Destination SVM : {dst_svm}",
+        ]
+
         same = src_svm == dst_svm
-        print("\n" + "=" * 60)
-        print("  CUTOVER PLAN SUMMARY")
-        print("=" * 60)
-        print(f"  Source SVM      : {src_svm}")
-        print(f"  Destination SVM : {dst_svm}")
         if same:
-            print("  Mode            : Same-SVM (remount only, no share recreation)")
+            lines.append(
+                "  Mode            : Same-SVM (remount only, no share recreation)"
+            )
         else:
-            print("  Mode            : Cross-SVM (full share recreation)")
+            lines.append("  Mode            : Cross-SVM (full share recreation)")
+
+        lines.append(f"  Volumes planned : {len(volume_names)}")
+        if volume_names:
+            lines.append("  Source          : volume_names from cutover_state.json")
 
         if shares:
-            print(f"\n  CIFS shares to migrate ({len(shares)}):")
+            lines.append("")
+            lines.append(f"  CIFS shares to migrate ({len(shares)}):")
             for share in shares:
-                print(
+                lines.append(
                     f"    - {share.share_name} "
                     f"(volume: {share.volume_name}, path: {share.path})"
                 )
         if exports:
-            print(f"\n  NFS export policies to reassign ({len(exports)}):")
+            lines.append("")
+            lines.append(f"  NFS export policies to reassign ({len(exports)}):")
             for exp in exports:
-                print(f"    - policy '{exp.policy_name}' (volume: {exp.volume_name})")
-        print("=" * 60)
+                lines.append(
+                    f"    - policy '{exp.policy_name}' (volume: {exp.volume_name})"
+                )
+
+        lines.append("=" * 60)
+        logging.info("\n%s", "\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +797,8 @@ def main() -> None:
     """
     setup_logging()
     args = parse_args()
+    if args.log_file:
+        _enable_file_logging(args.log_file)
 
     migrator = OntapMigrate(args)
 
