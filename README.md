@@ -83,13 +83,190 @@ python3 vol_decrypt.py --cluster cluster1.example.com --username admin \
 
 ```
 vol_decrypt/
-├── vol_decrypt.py       # Main script
+├── ontap_migrate.py     # Entry point: replicate / collect / cutover
+├── migrate/             # Migration package
+│   ├── __init__.py      # Public re-exports
+│   ├── snapmirror.py    # Module: SnapMirror replication + DP volume creation
+│   └── cutover.py       # Module: CIFS/NFS share collection + cutover logic
+├── tests/               # Test suite
+│   ├── __init__.py
+│   └── smoke_test.py    # 54 mock-based smoke tests (no live cluster needed)
+├── vol_decrypt.py       # Original: volume decryption via volume move
+├── cutover_state.json   # Runtime state file (auto-generated, git-ignored)
 ├── requirements.txt     # Python dependencies
 ├── README.md            # This file
-├── USER_GUIDE.md        # Operational guide (scheduling, troubleshooting)
-└── logs/                # Per-run log files (created automatically)
-    └── vol_decrypt_20260322_140000.log
+└── USER_GUIDE.md        # Operational guide
 ```
+
+---
+
+## SnapMirror Migration (`ontap_migrate.py`)
+
+Semi-automatic volume migration from a source ONTAP cluster/SVM to a
+destination cluster/SVM using SnapMirror as the data transport.
+
+### Workflow
+
+```
+1. replicate  →  Discover source volumes
+                 Select unencrypted destination aggregate
+                 Create DP volumes on destination
+                 Establish SnapMirror relationships (bulk)
+                 Start initial transfer
+
+2. collect    →  Read CIFS shares / NFS export policies + rules from source
+                 Write cutover_state.json (includes CIFS ACLs + nfs_policies)
+                 Persist explicit volume_names list for cutover execution
+                 (nfs_policies block contains full rule definitions)
+
+3. cutover    →  Load cutover_state.json
+                 Show summary + prompt for confirmation
+                 For each volume in volume_names:
+                   Skip if already listed in migrated_volumes (warning log)
+                   Run final SnapMirror update (blocking)
+                   Break SnapMirror (state: broken_off)
+                   Unmount source volume (remove junction_path)
+                   Mount destination volume (set junction_path)
+                   Re-create CIFS shares (with ACLs) or NFS export policies
+                   on destination
+                   (skipped for same-SVM migrations — remount only)
+                   Rename source volume to <name>_delete
+                   Set renamed source volume state to offline
+                   Rename destination volume from <name>_dst to <name>
+                   Mark volume as migrated in cutover_state.json
+```
+
+### Quick Start
+
+```bash
+# Step 1 — Replicate
+python3 ontap_migrate.py replicate \
+  --source-cluster 10.0.0.1 --source-username admin \
+  --destination-cluster 10.0.0.2 --destination-username admin \
+  --source-svm vs_prod --protocol cifs
+
+# Step 2 — Collect share/export state
+python3 ontap_migrate.py collect \
+  --source-cluster 10.0.0.1 --source-username admin \
+  --destination-cluster 10.0.0.2 --destination-username admin \
+  --source-svm vs_prod --protocol cifs
+
+# Step 3 — Execute cutover (interactive confirmation required)
+python3 ontap_migrate.py cutover \
+  --source-cluster 10.0.0.1 --source-username admin \
+  --destination-cluster 10.0.0.2 --destination-username admin \
+  --source-svm vs_prod --protocol cifs
+```
+
+Passwords can be provided via `--source-password` / `--destination-password`,
+via the `ONTAP_SRC_PASSWORD` / `ONTAP_DST_PASSWORD` environment variables,
+or interactively at the prompt.
+
+### CLI Arguments Reference
+
+| Argument | Commands | Required | Default | Description |
+|---|---|---|---|---|
+| `--source-cluster` | all | ✅ | — | Source cluster management IP or hostname |
+| `--source-username` | all | ✅ | — | Admin username for source cluster |
+| `--source-password` | all | — | `$ONTAP_SRC_PASSWORD` | Source cluster password |
+| `--destination-cluster` | all | ✅ | — | Destination cluster management IP or hostname |
+| `--destination-username` | all | ✅ | — | Admin username for destination cluster |
+| `--destination-password` | all | — | `$ONTAP_DST_PASSWORD` | Destination cluster password |
+| `--source-svm` | all | ✅ | — | Name of the source SVM |
+| `--destination-svm` | all | — | `<source-svm>_dst` | Name of the destination SVM |
+| `--protocol` | all | — | `cifs` | Protocol to migrate: `cifs`, `nfs`, or `both` |
+| `--exclude-volumes` | replicate, collect | — | none | Volume name(s) to skip |
+
+### Destination Volume Naming
+
+Source volumes are replicated with a `_dst` suffix on the destination:
+
+| Source | Destination |
+|---|---|
+| `vol_sales` | `vol_sales_dst` |
+| `vol_finance` | `vol_finance_dst` |
+
+The destination volume inherits `size`, `language`, and
+`security_style` from the source.
+
+### Same-SVM Cutover
+
+When `--source-svm` and `--destination-svm` refer to the same SVM:
+
+- SVM peering is **skipped** entirely.
+- CIFS share/ACL and NFS export policy recreation is **skipped**.
+- SnapMirror break + volume remount is performed.
+- Source volume is renamed to `<name>_delete` and then set to `offline`.
+- Destination volume is renamed from `<name>_dst` to the original name.
+
+### Same-Cluster Migration
+
+When `--source-cluster` and `--destination-cluster` are the same host
+(case-insensitive comparison):
+
+- Source credentials are **reused** for the destination — no second
+  password prompt.
+- A single `HostConnection` is used for both source and destination
+  operations.
+
+### NFS Export Policy Migration
+
+During `collect`, for each NFS volume the full export policy and all
+rules are read from the source SVM and persisted in `cutover_state.json`
+under `nfs_policies`. During `cutover`, the destination policy is
+created via a single `ExportPolicy.post` call including all rules.
+
+If a policy with the same name already exists on the destination SVM,
+it is **skipped** with a warning — no overwrite is performed.
+
+### Migration Progress Tracking
+
+`cutover_state.json` contains a `migrated_volumes` list that is updated
+after each successfully completed volume cutover. On subsequent `cutover`
+runs (e.g. after a partial failure or intentional interruption), any
+volume already present in `migrated_volumes` is **skipped** with a
+warning log entry — no duplicate work is performed. Volumes not yet in
+the list are processed normally.
+
+The state file also contains `volume_names`, which is used as the
+primary source for cutover iteration. This ensures cutover still runs
+for replicated volumes even when no CIFS share or NFS export entries
+exist for a volume.
+
+### CIFS ACL Migration
+
+During `collect`, CIFS share ACLs are captured via the share `acls`
+field and persisted to `cutover_state.json`. During cross-SVM `cutover`,
+ACLs are included when destination shares are recreated, preserving share
+permissions.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│              ontap_migrate.py               │
+│  OntapMigrate.run_replicate()               │
+│  OntapMigrate.run_collect()                 │
+│  OntapMigrate.run_cutover()                 │
+└──────────┬──────────────────┬───────────────┘
+           │                  │
+           ▼                  ▼
+┌──────────────────┐  ┌───────────────────────┐
+│  snapmirror.py   │  │      cutover.py        │
+│                  │  │                        │
+│  Aggregate sel.  │  │  collect_cifs_shares() │
+│  DP vol create   │  │  collect_nfs_exports() │
+│  SnapMirror bulk │  │  write_cutover_state() │
+│  post_collection │  │  CutoverExecutor       │
+└──────────────────┘  └───────────────────────┘
+           │                  │
+           └────────┬─────────┘
+                    ▼
+        ONTAP Cluster (src + dst)
+        HTTPS / REST API (port 443)
+```
+
+
 
 ## Architecture
 

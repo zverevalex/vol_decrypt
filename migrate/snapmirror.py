@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""
-snapmirror.py — NetApp ONTAP SnapMirror Replication
+"""snapmirror.py — NetApp ONTAP SnapMirror Replication.
 
 Replicates volumes from a source cluster/SVM to a destination cluster/SVM
-using SnapMirror relationships. Destination volumes are created automatically
-via the create_destination REST API parameter.
+using SnapMirror relationships. Destination DP volumes are created
+explicitly on an unencrypted aggregate before the relationship is
+established. This module is importable and used by ontap_migrate.py.
 
-Usage example:
-    python snapmirror.py \
-        --source-cluster 10.0.0.1 \
-        --source-username admin \
-        --destination-cluster 10.0.0.2 \
-        --destination-username admin \
-        --source-svm vs_prod \
+Usage example (standalone):
+    python snapmirror.py \\
+        --source-cluster 10.0.0.1 \\
+        --source-username admin \\
+        --destination-cluster 10.0.0.2 \\
+        --destination-username admin \\
+        --source-svm vs_prod \\
         --exclude-volumes vol_temp vol_scratch
 """
 
@@ -21,11 +21,12 @@ import getpass
 import logging
 import os
 import sys
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, TypeAlias
 
 import urllib3
 from netapp_ontap import HostConnection
 from netapp_ontap.resources import (
+    Aggregate,
     Cluster,
     SnapmirrorRelationship,
     Svm,
@@ -40,6 +41,7 @@ ENV_SRC_PASSWORD_VAR = "ONTAP_SRC_PASSWORD"
 ENV_DST_PASSWORD_VAR = "ONTAP_DST_PASSWORD"
 DEFAULT_POLICY = "MirrorAllSnapshots"
 DST_SVM_SUFFIX = "_dst"
+DST_VOLUME_SUFFIX = "_dst"
 
 LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(message)s"
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -49,6 +51,8 @@ LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Type definitions
 # ---------------------------------------------------------------------------
 
+RelationshipBody: TypeAlias = dict[str, dict[str, str] | str]
+
 
 class VolumeInfo(NamedTuple):
     """Volume information from the source cluster.
@@ -57,11 +61,29 @@ class VolumeInfo(NamedTuple):
         name: Volume name.
         uuid: Volume UUID.
         svm_name: Name of the source SVM containing the volume.
+        size: Volume size in bytes.
+        language: ONTAP language code (e.g. ``c.utf_8``).
+        security_style: Volume security style (for example ``ntfs``).
     """
 
     name: str
     uuid: str
     svm_name: str
+    size: int
+    language: str
+    security_style: str | None = None
+
+
+class AggregateInfo(NamedTuple):
+    """Unencrypted aggregate available on the destination cluster.
+
+    Attributes:
+        name: Aggregate name.
+        uuid: Aggregate UUID.
+    """
+
+    name: str
+    uuid: str
 
 
 class ReplicationContext(NamedTuple):
@@ -370,6 +392,9 @@ def ensure_svm_peer(
 ) -> None:
     """Ensure an SVM peer relationship exists between source and destination SVMs.
 
+    Skips peering entirely when source and destination SVM names are
+    identical, as intra-SVM SnapMirror does not require peering.
+
     Args:
         src_svm_name: Name of the source SVM.
         dst_svm_name: Name of the destination SVM.
@@ -379,6 +404,13 @@ def ensure_svm_peer(
     Returns:
         None
     """
+    if src_svm_name == dst_svm_name:
+        logging.info(
+            "Source and destination SVM are identical ('%s') — skipping SVM peering.",
+            src_svm_name,
+        )
+        return
+
     dst_cluster_name = get_cluster_name(dst_connection)
 
     # Check for existing peering from the source side
@@ -429,7 +461,11 @@ def get_source_volumes(
     exclude: list[str],
     connection: HostConnection,
 ) -> list[VolumeInfo]:
-    """Return a list of data volumes from the source SVM, excluding root and user-specified volumes.
+    """Return a list of data volumes from the source SVM.
+
+    Excludes the SVM root volume and any user-specified volumes.
+    Fetches size, language, and security style for each volume to
+    support DP volume creation.
 
     Args:
         svm_name: Name of the source SVM.
@@ -437,16 +473,13 @@ def get_source_volumes(
         connection: HostConnection to the source cluster.
 
     Returns:
-        list[VolumeInfo]: List of VolumeInfo instances.
+        list[VolumeInfo]: List of VolumeInfo instances including size and
+            language and security style properties.
     """
-    exclude_set = [v for v in exclude]
-    if len(exclude_set) == 0:
-        exclude_vols = {}
-    else:
-        exclude_vols = {"name": f"!{','.join(exclude_set)}"}
+    exclude_vols = {"name": f"!{','.join(exclude)}"} if exclude else {}
     volumes: list[VolumeInfo] = []
 
-    fields = "uuid,name,svm.name,type"
+    fields = "uuid,name,svm.name,type,size,language,nas.security_style"
     for vol in Volume.get_collection(
         connection=connection,
         fields=fields,
@@ -458,6 +491,13 @@ def get_source_volumes(
                 name=vol.name,
                 uuid=vol.uuid,
                 svm_name=svm_name,
+                size=vol.size,
+                language=vol.language,
+                security_style=getattr(
+                    getattr(vol, "nas", None),
+                    "security_style",
+                    None,
+                ),
             )
         )
 
@@ -467,6 +507,169 @@ def get_source_volumes(
         svm_name,
     )
     return volumes
+
+
+# ---------------------------------------------------------------------------
+# Aggregate selection
+# ---------------------------------------------------------------------------
+
+
+def get_unencrypted_aggregates(
+    connection: HostConnection,
+) -> list[AggregateInfo]:
+    """Return all aggregates on the destination cluster without software encryption.
+
+    Queries the Aggregate resource and filters for aggregates where
+    ``data_encryption.software_encryption_enabled`` is False.
+
+    Args:
+        connection: HostConnection to the destination cluster.
+
+    Returns:
+        list[AggregateInfo]: Aggregates eligible for unencrypted DP volume
+            placement.
+
+    Raises:
+        RuntimeError: If no unencrypted aggregates are found.
+    """
+    fields = "name,uuid,data_encryption"
+    candidates = [
+        AggregateInfo(name=agg.name, uuid=agg.uuid)
+        for agg in Aggregate.get_collection(
+            connection=connection,
+            fields=fields,
+        )
+        if not getattr(
+            getattr(agg, "data_encryption", None),
+            "software_encryption_enabled",
+            True,
+        )
+    ]
+
+    if not candidates:
+        raise RuntimeError(
+            "No unencrypted aggregates found on the destination cluster."
+        )
+
+    logging.info(
+        "Found %d unencrypted aggregate(s) on destination cluster.",
+        len(candidates),
+    )
+    return candidates
+
+
+def select_aggregate(
+    candidates: list[AggregateInfo],
+) -> AggregateInfo:
+    """Select one aggregate from the candidate list.
+
+    Automatically selects the only aggregate if exactly one is available.
+    Otherwise, presents a numbered prompt and waits for user input.
+
+    Args:
+        candidates: Non-empty list of AggregateInfo instances to choose from.
+
+    Returns:
+        AggregateInfo: The selected aggregate.
+
+    Raises:
+        ValueError: If ``candidates`` is empty.
+    """
+    if not candidates:
+        raise ValueError("Candidate list must not be empty.")
+
+    if len(candidates) == 1:
+        logging.info(
+            "Auto-selected aggregate '%s' (only candidate).",
+            candidates[0].name,
+        )
+        return candidates[0]
+
+    print("\nMultiple unencrypted aggregates available on the destination cluster:")
+    for i, agg in enumerate(candidates, start=1):
+        print(f"  [{i}] {agg.name}  (UUID: {agg.uuid})")
+
+    while True:
+        raw = input(f"\nSelect aggregate [1-{len(candidates)}]: ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(candidates):
+            chosen = candidates[int(raw) - 1]
+            logging.info("User selected aggregate '%s'.", chosen.name)
+            return chosen
+        print(
+            f"  Invalid selection. Please enter a number between "
+            f"1 and {len(candidates)}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# DP volume creation
+# ---------------------------------------------------------------------------
+
+
+def create_dp_volume(
+    vol: VolumeInfo,
+    dst_svm_name: str,
+    aggregate: AggregateInfo,
+    connection: HostConnection,
+) -> str:
+    """Create a DP-type destination volume for a SnapMirror relationship.
+
+    The destination volume name is the source volume name with
+    ``DST_VOLUME_SUFFIX`` appended. Size, language, and security style
+    are inherited from the source volume.
+
+    Args:
+        vol: Source VolumeInfo providing name, size, language, and
+            security style.
+        dst_svm_name: Name of the destination SVM.
+        aggregate: Target aggregate for volume placement.
+        connection: HostConnection to the destination cluster.
+
+    Returns:
+        str: Name of the created destination volume.
+
+    Raises:
+        RuntimeError: If volume creation fails.
+    """
+    dst_vol_name = f"{vol.name}{DST_VOLUME_SUFFIX}"
+
+    # Check whether the destination volume already exists
+    existing = list(
+        Volume.get_collection(
+            connection=connection,
+            fields="name",
+            **{"svm.name": dst_svm_name, "name": dst_vol_name},
+        )
+    )
+    if existing:
+        logging.info(
+            "Destination volume '%s' already exists, skipping creation.",
+            dst_vol_name,
+        )
+        return dst_vol_name
+
+    volume_body = {
+        "name": dst_vol_name,
+        "type": "dp",
+        "size": vol.size,
+        "language": vol.language,
+        "svm": {"name": dst_svm_name},
+        "aggregates": [{"name": aggregate.name}],
+    }
+    if vol.security_style:
+        volume_body["nas"] = {"security_style": vol.security_style}
+
+    dp_vol = Volume.from_dict(volume_body)
+    dp_vol.set_connection(connection)
+    dp_vol.post()
+
+    logging.info(
+        "Created DP volume '%s' on aggregate '%s' in SVM '%s'.",
+        dst_vol_name,
+        aggregate.name,
+        dst_svm_name,
+    )
+    return dst_vol_name
 
 
 # ---------------------------------------------------------------------------
@@ -514,44 +717,101 @@ def filter_existing_relationships(
 def build_relationship_body(
     ctx: ReplicationContext,
     volume_name: str,
-) -> dict[str, object]:
-    """Build the request body for a single SnapMirror relationship.
+) -> RelationshipBody:
+    """Build the request body for a single SnapMirror relationship POST.
+
+    The destination volume is expected to already exist as a DP volume
+    named ``<volume_name><DST_VOLUME_SUFFIX>``. No automatic destination
+    creation is performed. The ``state`` field is intentionally omitted
+    here because ONTAP requires the relationship to be initialized first;
+    the transfer is started via a separate PATCH to ``snapmirrored``.
 
     Args:
         ctx: ReplicationContext containing cluster and SVM information.
-        volume_name: Name of the volume to replicate.
+        volume_name: Name of the source volume to replicate.
 
     Returns:
-        dict[str, object]: SnapMirror relationship request body with create_destination
-            enabled, policy set to MirrorAllSnapshots, and state set to snapmirrored.
+        RelationshipBody: SnapMirror relationship request body with
+            policy set to MirrorAllSnapshots.
     """
+    dst_vol_name = f"{volume_name}{DST_VOLUME_SUFFIX}"
     return {
         "source": {
             "cluster": {"name": ctx.src_cluster_name},
             "path": f"{ctx.src_svm_name}:{volume_name}",
         },
         "destination": {
-            "path": f"{ctx.dst_svm_name}:{volume_name}",
+            "path": f"{ctx.dst_svm_name}:{dst_vol_name}",
         },
         "policy": {
             "name": DEFAULT_POLICY,
         },
-        "create_destination": {
-            "enabled": True,
-        },
-        "state": "snapmirrored",
     }
 
 
 # noinspection SpellCheckingInspection
+def _start_snapmirror_transfers(
+    volumes: list[VolumeInfo],
+    dst_svm_name: str,
+    connection: HostConnection,
+) -> None:
+    """Patch each SnapMirror relationship to state ``snapmirrored``.
+
+    Called after ``post_collection`` to start the initial baseline
+    transfer. Each relationship is fetched by its destination path and
+    patched individually. Failures are logged as warnings so a single
+    unresponsive relationship does not abort the remaining transfers.
+
+    Args:
+        volumes: List of source volumes whose relationships should be
+            started.
+        dst_svm_name: Name of the destination SVM.
+        connection: HostConnection to the destination cluster.
+
+    Returns:
+        None
+    """
+    for vol in volumes:
+        dst_vol_name = f"{vol.name}{DST_VOLUME_SUFFIX}"
+        dst_path = f"{dst_svm_name}:{dst_vol_name}"
+
+        results = list(
+            SnapmirrorRelationship.get_collection(
+                connection=connection,
+                fields="uuid,state",
+                **{"destination.path": dst_path},
+            )
+        )
+        if not results:
+            logging.warning(
+                "Could not find SnapMirror relationship for '%s' "
+                "to start transfer; skipping.",
+                dst_path,
+            )
+            continue
+
+        rel = results[0]
+        rel.set_connection(connection)
+        rel.state = "snapmirrored"
+        rel.patch()
+        logging.info(
+            "SnapMirror transfer started for '%s' (state → snapmirrored).",
+            dst_path,
+        )
+
+
 def create_snapmirror_relationships(
     ctx: ReplicationContext,
     volumes: list[VolumeInfo],
 ) -> None:
-    """Create SnapMirror relationships in bulk for the given volumes.
+    """Create SnapMirror relationships in bulk and start initial transfers.
 
-    Filters out existing relationships and creates new ones in a single batch
-    request via SnapmirrorRelationship.post_collection().
+    For each volume, a DP-type destination volume is created on an
+    unencrypted aggregate before the SnapMirror relationship is posted.
+    Existing relationships are skipped. All new relationships are posted
+    in a single batch via ``SnapmirrorRelationship.post_collection``.
+    After the bulk post, each relationship is individually patched to
+    state ``snapmirrored`` to start the baseline transfer.
 
     Args:
         ctx: ReplicationContext containing cluster and SVM information.
@@ -564,7 +824,6 @@ def create_snapmirror_relationships(
         logging.info("No volumes found for SnapMirror replication, nothing to do.")
         return
 
-    # Filter out volumes that already have relationships
     volumes = filter_existing_relationships(
         ctx.dst_svm_name,
         volumes,
@@ -577,6 +836,14 @@ def create_snapmirror_relationships(
         )
         return
 
+    # Select destination aggregate once for all volumes
+    candidates = get_unencrypted_aggregates(ctx.dst_connection)
+    aggregate = select_aggregate(candidates)
+
+    # Create DP volumes on the selected aggregate
+    for vol in volumes:
+        create_dp_volume(vol, ctx.dst_svm_name, aggregate, ctx.dst_connection)
+
     record_bodies = [build_relationship_body(ctx, vol.name) for vol in volumes]
 
     logging.info(
@@ -586,12 +853,14 @@ def create_snapmirror_relationships(
         ctx.dst_svm_name,
     )
     for rec in record_bodies:
-        logging.debug("  %s", rec["source"]["path"])
+        src = rec.get("source", {})
+        logging.debug("  %s", src.get("path", ""))
 
     records = [SnapmirrorRelationship.from_dict(body) for body in record_bodies]
     SnapmirrorRelationship.post_collection(records, connection=ctx.dst_connection)
+    logging.info("SnapMirror relationships created. Starting baseline transfers.")
 
-    logging.info("SnapMirror relationships created successfully and transfer started.")
+    _start_snapmirror_transfers(volumes, ctx.dst_svm_name, ctx.dst_connection)
 
 
 # ---------------------------------------------------------------------------
