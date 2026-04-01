@@ -20,6 +20,7 @@ run standalone.
 
 import json
 import logging
+from collections.abc import Iterable
 from pathlib import Path
 from typing import NamedTuple, TypeAlias
 
@@ -155,15 +156,27 @@ def collect_cifs_shares(
         fields=fields,
         **{"svm.name": svm_name},
     ):
-        vol_name = getattr(getattr(share, "volume", None), "name", None)
-        if vol_name not in volume_set:
+        raw_vol_name = getattr(getattr(share, "volume", None), "name", None)
+        if not isinstance(raw_vol_name, str):
             continue
+        if raw_vol_name not in volume_set:
+            continue
+
+        share_name = getattr(share, "name", None)
+        if not isinstance(share_name, str) or not share_name:
+            continue
+
+        raw_path = getattr(share, "path", "/")
+        raw_comment = getattr(share, "comment", "")
+        share_path = raw_path if isinstance(raw_path, str) else "/"
+        share_comment = raw_comment if isinstance(raw_comment, str) else ""
+
         shares.append(
             ShareInfo(
-                share_name=share.name,
-                volume_name=vol_name,
-                path=getattr(share, "path", "/"),
-                comment=getattr(share, "comment", ""),
+                share_name=share_name,
+                volume_name=raw_vol_name,
+                path=share_path,
+                comment=share_comment,
                 acls=_serialize_share_acls(getattr(share, "acls", None)),
             )
         )
@@ -186,6 +199,10 @@ def _serialize_share_acls(raw_acls: object) -> list[dict[str, object]]:
         list[dict[str, object]]: Normalized ACL entries.
     """
     if not raw_acls:
+        return []
+    if isinstance(raw_acls, (str, bytes)):
+        return []
+    if not isinstance(raw_acls, Iterable):
         return []
 
     serialized: list[dict[str, object]] = []
@@ -244,15 +261,15 @@ def collect_nfs_exports(
         if not results:
             continue
         vol = results[0]
-        policy_name = getattr(
+        raw_policy_name = getattr(
             getattr(getattr(vol, "nas", None), "export_policy", None),
             "name",
             None,
         )
-        if policy_name:
+        if isinstance(raw_policy_name, str) and raw_policy_name:
             exports.append(
                 ExportInfo(
-                    policy_name=policy_name,
+                    policy_name=raw_policy_name,
                     volume_name=vol_name,
                 )
             )
@@ -694,6 +711,7 @@ class CutoverExecutor:
     # Volume mount / unmount
     # ------------------------------------------------------------------
 
+    # noinspection PyMethodMayBeStatic
     def _get_junction_path(
         self,
         svm_name: str,
@@ -976,7 +994,7 @@ class CutoverExecutor:
         volume_shares = [s for s in shares if s.volume_name == volume_name]
 
         for share in volume_shares:
-            share_body = {
+            share_body: dict[str, object] = {
                 "name": share.share_name,
                 "path": share.path,
                 "comment": share.comment,
@@ -994,6 +1012,7 @@ class CutoverExecutor:
                 dst_vol_name,
             )
 
+    # noinspection PyMethodMayBeStatic
     def _build_nfs_rule_body(self, rule: NfsRuleInfo) -> dict[str, object]:
         """Build a postable export rule body from a stored NFS rule object.
 
@@ -1116,6 +1135,7 @@ class CutoverExecutor:
             self._nfs_policy_sync_done = True
         return self._nfs_policy_map
 
+    # noinspection PyMethodMayBeStatic
     def _policy_has_rules(
         self,
         policy_name: str,
@@ -1162,7 +1182,7 @@ class CutoverExecutor:
         """
         if self._same_svm:
             logging.info(
-                "Same SVM detected — skipping NFS export recreation for volume '%s'.",
+                "Same SVM detected - skipping NFS export recreation for volume '%s'.",
                 volume_name,
             )
             return

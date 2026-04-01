@@ -7,6 +7,22 @@ The format is based on Keep a Changelog,
 and this project follows Semantic Versioning.
 
 
+1.0.2 - 2026-04-01
+------------------
+
+Changed
+~~~~~~~
+
+- Restored missing NFS policy helper methods in ``CutoverExecutor``
+  (``ensure_destination_nfs_policies``,
+  ``_ensure_nfs_policy_sync_once``, ``_policy_exists_on_destination``,
+  ``_create_destination_nfs_policy``, ``_policy_has_rules``,
+  ``recreate_nfs_exports``) to keep cutover flow and tests consistent.
+- Strengthened typing in ``migrate/snapmirror.py`` for relationship-body
+  construction and debug logging path extraction.
+- Bumped CLI/app version in ``ontap_migrate.py`` to ``1.0.2``.
+
+
 1.0.1 - 2026-03-31
 ------------------
 

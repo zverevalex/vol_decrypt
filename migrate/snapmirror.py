@@ -51,7 +51,10 @@ LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Type definitions
 # ---------------------------------------------------------------------------
 
-RelationshipBody: TypeAlias = dict[str, dict[str, str] | str]
+EndpointClusterBody: TypeAlias = dict[str, str]
+EndpointBody: TypeAlias = dict[str, EndpointClusterBody | str]
+PolicyBody: TypeAlias = dict[str, str]
+RelationshipBody: TypeAlias = dict[str, object]
 
 
 class VolumeInfo(NamedTuple):
@@ -717,7 +720,7 @@ def filter_existing_relationships(
 def build_relationship_body(
     ctx: ReplicationContext,
     volume_name: str,
-) -> RelationshipBody:
+) -> dict[str, object]:
     """Build the request body for a single SnapMirror relationship POST.
 
     The destination volume is expected to already exist as a DP volume
@@ -735,7 +738,7 @@ def build_relationship_body(
             policy set to MirrorAllSnapshots.
     """
     dst_vol_name = f"{volume_name}{DST_VOLUME_SUFFIX}"
-    return {
+    relationship_body: dict[str, object] = {
         "source": {
             "cluster": {"name": ctx.src_cluster_name},
             "path": f"{ctx.src_svm_name}:{volume_name}",
@@ -747,6 +750,7 @@ def build_relationship_body(
             "name": DEFAULT_POLICY,
         },
     }
+    return relationship_body
 
 
 # noinspection SpellCheckingInspection
@@ -854,7 +858,8 @@ def create_snapmirror_relationships(
     )
     for rec in record_bodies:
         src = rec.get("source", {})
-        logging.debug("  %s", src.get("path", ""))
+        src_path = src.get("path", "") if isinstance(src, dict) else ""
+        logging.debug("  %s", src_path)
 
     records = [SnapmirrorRelationship.from_dict(body) for body in record_bodies]
     SnapmirrorRelationship.post_collection(records, connection=ctx.dst_connection)

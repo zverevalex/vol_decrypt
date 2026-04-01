@@ -51,7 +51,7 @@ from migrate.snapmirror import (
 # ---------------------------------------------------------------------------
 
 _PROTOCOL_CHOICES = ("cifs", "nfs", "both")
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 __version__ = APP_VERSION
 __author__ = "Pascal Scheiben"
 __email__ = "pascal.scheiben@netapp.com"
