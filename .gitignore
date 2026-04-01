@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 logs/
+cutover_state.json
+
+.github/
+AGENTS.md

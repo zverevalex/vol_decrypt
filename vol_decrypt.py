@@ -32,9 +32,10 @@ LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def bytes_to_gib(b):
     """Convert bytes to GiB with 2 decimal places."""
-    return round(b / (1024 ** 3), 2)
+    return round(b / (1024**3), 2)
 
 
 def pct(used, total):
@@ -80,7 +81,9 @@ examples:
   %(prog)s --cluster 10.0.0.1 --username admin --exclude-volume root_vol
 """,
     )
-    p.add_argument("--cluster", required=True, help="Cluster management IP or hostname.")
+    p.add_argument(
+        "--cluster", required=True, help="Cluster management IP or hostname."
+    )
     p.add_argument("--username", required=True, help="Admin username.")
     p.add_argument(
         "--password",
@@ -99,7 +102,9 @@ examples:
         default=DEFAULT_CAPACITY_THRESHOLD,
         help=f"Max aggregate usage %% after move (default: {DEFAULT_CAPACITY_THRESHOLD}).",
     )
-    p.add_argument("--dry-run", action="store_true", help="Log planned moves without executing.")
+    p.add_argument(
+        "--dry-run", action="store_true", help="Log planned moves without executing."
+    )
     p.add_argument(
         "--verify-ssl",
         action="store_true",
@@ -139,14 +144,18 @@ examples:
 # ONTAP interaction
 # ---------------------------------------------------------------------------
 
+
 def connect(cluster, username, password, verify_ssl):
     """Establish a global HostConnection."""
     import urllib3
-    from netapp_ontap import HostConnection, config as ontap_config
+    from netapp_ontap import HostConnection
+    from netapp_ontap import config as ontap_config
 
     if not verify_ssl:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    conn = HostConnection(cluster, username=username, password=password, verify=verify_ssl)
+    conn = HostConnection(
+        cluster, username=username, password=password, verify=verify_ssl
+    )
     ontap_config.CONNECTION = conn
     logging.info("Connected to cluster: %s (SSL verify: %s)", cluster, verify_ssl)
 
@@ -187,8 +196,8 @@ def get_aggregates():
 
 def get_in_flight_moves():
     """Return list of volumes currently undergoing a move."""
-    from netapp_ontap.resources import Volume
     from netapp_ontap.error import NetAppRestError
+    from netapp_ontap.resources import Volume
 
     in_flight = []
     fields = "uuid,name,svm.name,movement.state,movement.percent_complete,movement.destination_aggregate"
@@ -204,14 +213,16 @@ def get_in_flight_moves():
                 dest = getattr(state, "destination_aggregate", None)
                 if dest:
                     dest_aggr_name = getattr(dest, "name", "")
-                in_flight.append({
-                    "name": vol.name,
-                    "uuid": vol.uuid,
-                    "svm": vol.svm.name if vol.svm else "",
-                    "state": move_state,
-                    "percent_complete": getattr(state, "percent_complete", None),
-                    "destination_aggregate": dest_aggr_name,
-                })
+                in_flight.append(
+                    {
+                        "name": vol.name,
+                        "uuid": vol.uuid,
+                        "svm": vol.svm.name if vol.svm else "",
+                        "state": move_state,
+                        "percent_complete": getattr(state, "percent_complete", None),
+                        "destination_aggregate": dest_aggr_name,
+                    }
+                )
     except NetAppRestError as exc:
         logging.warning("Could not query in-flight moves: %s", exc)
     return in_flight
@@ -251,7 +262,11 @@ def get_encrypted_volumes(svm_filter=None, exclude_volumes=None):
         if move:
             move_state = getattr(move, "state", None)
             if move_state and move_state in ACTIVE_MOVE_STATES:
-                logging.debug("Skipping volume %s — move already in progress (%s)", vol.name, move_state)
+                logging.debug(
+                    "Skipping volume %s — move already in progress (%s)",
+                    vol.name,
+                    move_state,
+                )
                 continue
 
         # Determine current aggregate and node
@@ -271,16 +286,18 @@ def get_encrypted_volumes(svm_filter=None, exclude_volumes=None):
         if sp:
             space_used = getattr(sp, "used", 0) or 0
 
-        volumes.append({
-            "name": vol.name,
-            "uuid": vol.uuid,
-            "svm": vol.svm.name if vol.svm else "",
-            "size": vol.size or 0,
-            "space_used": space_used,
-            "current_aggr": current_aggr_name,
-            "current_node": current_node_name,
-            "style": vol.style,
-        })
+        volumes.append(
+            {
+                "name": vol.name,
+                "uuid": vol.uuid,
+                "svm": vol.svm.name if vol.svm else "",
+                "size": vol.size or 0,
+                "space_used": space_used,
+                "current_aggr": current_aggr_name,
+                "current_node": current_node_name,
+                "style": vol.style,
+            }
+        )
 
     return volumes
 
@@ -288,6 +305,7 @@ def get_encrypted_volumes(svm_filter=None, exclude_volumes=None):
 # ---------------------------------------------------------------------------
 # Aggregate selection
 # ---------------------------------------------------------------------------
+
 
 def select_target_aggregate(vol_info, aggr_map, node_map, capacity_threshold):
     """Pick the best aggregate for decrypting a volume.
@@ -349,6 +367,7 @@ def select_target_aggregate(vol_info, aggr_map, node_map, capacity_threshold):
 # Volume move
 # ---------------------------------------------------------------------------
 
+
 def start_volume_move(vol_info, target_aggr, dry_run):
     """Issue PATCH to start a volume move with encryption disabled.
 
@@ -361,12 +380,14 @@ def start_volume_move(vol_info, target_aggr, dry_run):
     if dry_run:
         logging.info(
             "[DRY-RUN] Would move volume %s (SVM: %s) to aggregate %s with encryption disabled.",
-            vol_name, svm_name, target_aggr,
+            vol_name,
+            svm_name,
+            target_aggr,
         )
         return True
 
-    from netapp_ontap.resources import Volume
     from netapp_ontap.error import NetAppRestError
+    from netapp_ontap.resources import Volume
 
     try:
         vol = Volume(uuid=vol_uuid)
@@ -375,7 +396,9 @@ def start_volume_move(vol_info, target_aggr, dry_run):
         vol.patch(poll=False)
         logging.info(
             "Volume move started: %s (SVM: %s) -> aggregate %s (encrypt-destination: false)",
-            vol_name, svm_name, target_aggr,
+            vol_name,
+            svm_name,
+            target_aggr,
         )
         return True
     except NetAppRestError as exc:
@@ -386,6 +409,7 @@ def start_volume_move(vol_info, target_aggr, dry_run):
 # ---------------------------------------------------------------------------
 # Main orchestration
 # ---------------------------------------------------------------------------
+
 
 def run(args):
     log_file = setup_logging(args.log_dir)
@@ -414,10 +438,18 @@ def run(args):
     if in_flight:
         log.info("In-flight volume moves: %d", len(in_flight))
         for m in in_flight:
-            pct_str = f"{m['percent_complete']}%" if m["percent_complete"] is not None else "N/A"
+            pct_str = (
+                f"{m['percent_complete']}%"
+                if m["percent_complete"] is not None
+                else "N/A"
+            )
             log.info(
                 "  %-30s  SVM: %-15s  State: %-15s  Progress: %s  Dest: %s",
-                m["name"], m["svm"], m["state"], pct_str, m["destination_aggregate"],
+                m["name"],
+                m["svm"],
+                m["state"],
+                pct_str,
+                m["destination_aggregate"],
             )
     else:
         log.info("No in-flight volume moves detected.")
@@ -426,12 +458,18 @@ def run(args):
     if available_slots <= 0:
         log.warning(
             "Max concurrent limit reached (%d/%d in-flight). No new moves will be started.",
-            len(in_flight), args.max_concurrent,
+            len(in_flight),
+            args.max_concurrent,
         )
         log.info("Run complete. No new moves started.")
         return
 
-    log.info("Available move slots: %d (max %d, in-flight %d)", available_slots, args.max_concurrent, len(in_flight))
+    log.info(
+        "Available move slots: %d (max %d, in-flight %d)",
+        available_slots,
+        args.max_concurrent,
+        len(in_flight),
+    )
     log.info("-" * 72)
 
     # --- Discover aggregates ---
@@ -452,7 +490,9 @@ def run(args):
 
     # --- Discover encrypted volumes ---
     log.info("Discovering NVE-encrypted volumes...")
-    encrypted_vols = get_encrypted_volumes(svm_filter=args.svm, exclude_volumes=args.exclude_volume)
+    encrypted_vols = get_encrypted_volumes(
+        svm_filter=args.svm, exclude_volumes=args.exclude_volume
+    )
 
     # Resolve node names from aggr_map (not available on volumes endpoint)
     for v in encrypted_vols:
@@ -464,11 +504,14 @@ def run(args):
         log.info("Run complete.")
         return
 
-    log.info("Found %d encrypted volume(s) eligible for decryption:", len(encrypted_vols))
+    log.info(
+        "Found %d encrypted volume(s) eligible for decryption:", len(encrypted_vols)
+    )
     for v in encrypted_vols:
         log.info(
             "  %-30s  SVM: %-15s  Size: %8.2f GiB  Used: %8.2f GiB  Aggr: %-25s  Node: %s",
-            v["name"], v["svm"],
+            v["name"],
+            v["svm"],
             bytes_to_gib(v["size"]),
             bytes_to_gib(v["space_used"]),
             v["current_aggr"],
@@ -483,7 +526,10 @@ def run(args):
 
     for v in encrypted_vols:
         if moves_started >= available_slots:
-            log.info("Concurrent move limit reached (%d). Remaining volumes deferred to next run.", available_slots)
+            log.info(
+                "Concurrent move limit reached (%d). Remaining volumes deferred to next run.",
+                available_slots,
+            )
             break
 
         target_aggr, projected_pct, is_cross_node = select_target_aggregate(
@@ -494,8 +540,11 @@ def run(args):
             log.warning(
                 "SKIPPED %s (SVM: %s): no aggregate found with projected usage <= %d%%. "
                 "Current aggr: %s, volume used: %.2f GiB.",
-                v["name"], v["svm"], args.capacity_threshold,
-                v["current_aggr"], bytes_to_gib(v["space_used"]),
+                v["name"],
+                v["svm"],
+                args.capacity_threshold,
+                v["current_aggr"],
+                bytes_to_gib(v["space_used"]),
             )
             moves_skipped_capacity += 1
             continue
@@ -503,7 +552,12 @@ def run(args):
         move_type = "CROSS-NODE" if is_cross_node else "SAME-NODE"
         log.info(
             "Planning move for %s (SVM: %s): %s -> %s [%s]  Projected usage: %.1f%%",
-            v["name"], v["svm"], v["current_aggr"], target_aggr, move_type, projected_pct,
+            v["name"],
+            v["svm"],
+            v["current_aggr"],
+            target_aggr,
+            move_type,
+            projected_pct,
         )
 
         success = start_volume_move(v, target_aggr, args.dry_run)
@@ -525,10 +579,19 @@ def run(args):
     log.info("=" * 72)
     log.info("Encrypted volumes discovered:  %d", len(encrypted_vols))
     log.info("In-flight moves (prior runs):  %d", len(in_flight))
-    log.info("Moves started this run:        %d%s", moves_started, " (dry-run)" if args.dry_run else "")
+    log.info(
+        "Moves started this run:        %d%s",
+        moves_started,
+        " (dry-run)" if args.dry_run else "",
+    )
     log.info("Skipped (capacity threshold):  %d", moves_skipped_capacity)
     log.info("Skipped (API error):           %d", moves_skipped_error)
-    remaining = len(encrypted_vols) - moves_started - moves_skipped_capacity - moves_skipped_error
+    remaining = (
+        len(encrypted_vols)
+        - moves_started
+        - moves_skipped_capacity
+        - moves_skipped_error
+    )
     if remaining > 0:
         log.info("Deferred to next run (limit):  %d", remaining)
     log.info("Log file: %s", log_file)
@@ -540,7 +603,9 @@ def main():
     try:
         from netapp_ontap.error import NetAppRestError
     except ImportError:
-        logging.error("The netapp-ontap library is not installed. Run: pip install netapp-ontap")
+        logging.error(
+            "The netapp-ontap library is not installed. Run: pip install netapp-ontap"
+        )
         sys.exit(1)
     try:
         run(args)
