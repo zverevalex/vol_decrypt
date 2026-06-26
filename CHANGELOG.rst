@@ -7,6 +7,59 @@ The format is based on Keep a Changelog,
 and this project follows Semantic Versioning.
 
 
+1.1.0 - 2026-06-23
+------------------
+
+Added
+~~~~~
+
+- ``vol_schedule.py`` — Interactive migration planner script for bulk volume
+  move operations. Discovers all RW, online volumes in a specified SVM, renders
+  per-volume aggregate selection UI, and writes YAML plan files to
+  ``plans/<cluster_name>_<svm>.yaml``.
+  
+  - Supports ``--cluster``, ``--username``, ``--svm`` (required args)
+  - ``--password`` falls back to ``$ONTAP_PASSWORD`` env var
+  - Skips root volumes and volumes already in-flight
+  - Prints numbered volume table and per-volume aggregate tables
+  - Interactive prompts for volume selection and aggregate assignment
+  - Writes timestamped logs to ``logs/vol_schedule_<YYYYMMDD_HHMMSS>.log``
+  - Supports ``--dry-run``, ``--verify-ssl``, ``--log-dir``, ``--output``
+
+- ``vol_move_exec.py`` — Scheduled migration executor script for YAML plan
+  execution. Reads plan file(s) and orchestrates volume move operations with
+  concurrency limits and idempotent status tracking.
+  
+  - Reads single plan file (``--plan <file> --cluster <host>``) or
+    directory of plans (``--plans-dir <dir>``, defaults to ``./plans/``)
+  - Per-run status refresh: queries ONTAP ``movement.state`` and updates
+    ``in_progress`` statuses
+  - Starts ``pending`` moves up to ``--max-concurrent`` slots (default 6)
+  - Status lifecycle: ``pending`` → ``in_progress`` → ``done`` / ``failed``
+  - Writes updated YAML back after each run
+  - Per-plan + combined summary for multi-cluster runs
+  - Idempotent design: safe to run as cron job with ``flock``
+  - Writes timestamped logs to ``logs/vol_move_exec_<YYYYMMDD_HHMMSS>.log``
+  - Supports ``--dry-run``, ``--verify-ssl``, ``--log-dir``, ``--max-concurrent``
+
+- YAML plan schema for ``vol_schedule.py`` output and ``vol_move_exec.py``
+  input:
+  
+  .. code-block:: yaml
+  
+    cluster: "bahamas.muccbc.hq.netapp.com"
+    svm: "azvsvmmgt002"
+    volumes:
+      - name: "vol_data_01"
+        uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+        target_aggregate: "aggr1_node1"
+        status: "pending"   # pending | in_progress | done | failed
+        error: null
+
+- Dependency: ``PyYAML==6.0.2`` added to ``requirements.txt`` for plan
+  serialization/deserialization.
+
+
 1.0.2 - 2026-04-01
 ------------------
 

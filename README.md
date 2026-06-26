@@ -84,6 +84,9 @@ python3 vol_decrypt.py --cluster cluster1.example.com --username admin \
 ```
 vol_decrypt/
 ├── ontap_migrate.py     # Entry point: replicate / collect / cutover
+├── vol_decrypt.py       # Volume decryption via unencrypted aggregate move
+├── vol_schedule.py      # Interactive migration planner (bulk volume selection)
+├── vol_move_exec.py     # Scheduled migration executor (YAML plan processor)
 ├── migrate/             # Migration package
 │   ├── __init__.py      # Public re-exports
 │   ├── snapmirror.py    # Module: SnapMirror replication + DP volume creation
@@ -91,7 +94,8 @@ vol_decrypt/
 ├── tests/               # Test suite
 │   ├── __init__.py
 │   └── smoke_test.py    # 54 mock-based smoke tests (no live cluster needed)
-├── vol_decrypt.py       # Original: volume decryption via volume move
+├── plans/               # YAML plan files (auto-created; git-ignored)
+├── logs/                # Per-run log files (auto-created; git-ignored)
 ├── cutover_state.json   # Runtime state file (auto-generated, git-ignored)
 ├── requirements.txt     # Python dependencies
 ├── README.md            # This file
@@ -273,7 +277,290 @@ permissions.
         HTTPS / REST API (port 443)
 ```
 
+---
 
+## Bulk Volume Move Scheduling (`vol_schedule.py` & `vol_move_exec.py`)
+
+Two-phase workflow for **non-disruptive bulk volume move operations**: interactive planning followed by unattended execution.
+
+### Workflow
+
+```
+1. vol_schedule.py  →  Connect to cluster
+                      Discover all RW, online volumes in SVM
+                      Display numbered volume table
+                      ▪ Prompt user: select volumes (comma-sep, or 'all')
+                      ▪ For each volume, display available target aggregates
+                      ▪ Prompt user: select target aggregate
+                      Write YAML plan → plans/<cluster_name>_<svm>.yaml
+
+2. vol_move_exec.py →  Read YAML plan file(s) from directory or --plan arg
+                      For each plan:
+                        ▪ Query ONTAP movement.state to refresh in_progress
+                        ▪ Start pending moves (up to --max-concurrent)
+                        ▪ Update YAML status: pending → in_progress → done/failed
+                        ▪ Write updated YAML back
+                      Print per-plan + combined summary
+                      (Run as cron job; idempotent with flock)
+```
+
+### `vol_schedule.py` — Interactive Planning
+
+Discovers volumes in a single SVM and interactively guides you through volume
+and aggregate selection. Outputs a YAML plan file for execution.
+
+#### Quick Start
+
+```bash
+# Interactive planning session (prompts for volume & aggregate selection)
+export ONTAP_PASSWORD='s3cret'
+python3 vol_schedule.py --cluster 10.0.0.1 --username admin --svm vs_prod
+
+# Dry-run: no YAML written
+python3 vol_schedule.py --cluster 10.0.0.1 --username admin --svm vs_prod \
+  --dry-run
+
+# Custom output file
+python3 vol_schedule.py --cluster 10.0.0.1 --username admin --svm vs_prod \
+  --output /tmp/my_migration_plan.yaml
+```
+
+#### Behaviour
+
+1. **Discovers** all read-write, online volumes in the specified SVM
+   - Skips root volumes (e.g., `vol0`)
+   - Skips volumes already in-flight (status: `volume move in progress`)
+
+2. **Renders** a numbered table:
+   ```
+   │ # │ Volume Name │ SVM │ Size (GiB) │ Used (GiB) │ Current Aggregate │
+   ├───┼─────────────┼─────┼────────────┼────────────┼──────────────────┤
+   │ 1 │ vol_data_01 │ ... │ 100        │ 45         │ aggr1_node1      │
+   │ 2 │ vol_data_02 │ ... │ 200        │ 120        │ aggr1_node1      │
+   ```
+
+3. **Prompts** user to select which volumes to move:
+   ```
+   Select volumes to schedule (comma-separated numbers, or 'all'): 1,2,3
+   ```
+
+4. **For each selected volume**, displays available target aggregates
+   (current aggregate excluded):
+   ```
+   vol_data_01: Current aggregate is aggr1_node1
+   Available targets:
+   │ # │ Aggregate Name │ Node │ Total (GiB) │ Used (GiB) │ Available (GiB) │
+   ├───┼────────────────┼──────┼─────────────┼────────────┼─────────────────┤
+   │ 1 │ aggr2_node1    │ ...  │ 1000        │ 450        │ 550             │
+   │ 2 │ aggr1_node2    │ ...  │ 1500        │ 600        │ 900             │
+   
+   Select target aggregate: 1
+   ```
+
+5. **Writes** a YAML plan file:
+   ```yaml
+   cluster: "10.0.0.1"
+   svm: "vs_prod"
+   volumes:
+     - name: "vol_data_01"
+       uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+       target_aggregate: "aggr2_node1"
+       status: "pending"
+       error: null
+     - name: "vol_data_02"
+       uuid: "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+       target_aggregate: "aggr1_node2"
+       status: "pending"
+       error: null
+   ```
+
+#### CLI Arguments
+
+| Argument | Required | Default | Description |
+|---|---|---|---|
+| `--cluster` | ✅ | — | Cluster management IP or hostname |
+| `--username` | ✅ | — | Admin username |
+| `--password` | — | `$ONTAP_PASSWORD` | Admin password |
+| `--svm` | ✅ | — | SVM name to discover volumes |
+| `--output` | — | `plans/<cluster_name>_<svm>.yaml` | Output YAML plan file path |
+| `--dry-run` | — | `false` | Prompt for selections but don't write YAML |
+| `--verify-ssl` | — | `false` | Verify SSL certificates |
+| `--log-dir` | — | `./logs/` | Directory for log files |
+
+#### Logs
+
+- Timestamped log file: `logs/vol_schedule_<YYYYMMDD_HHMMSS>.log`
+- All prompts, volume discoveries, and YAML write operations are logged
+
+---
+
+### `vol_move_exec.py` — Scheduled Execution
+
+Reads YAML plan file(s) and orchestrates volume move operations with
+concurrency limits and idempotent status tracking. Designed to run unattended
+as a cron job.
+
+#### Quick Start
+
+```bash
+# Single plan file (cluster from --cluster arg)
+export ONTAP_PASSWORD='s3cret'
+python3 vol_move_exec.py --plan plans/10.0.0.1_vs_prod.yaml \
+  --cluster 10.0.0.1 --username admin
+
+# All plans in directory (cluster read from each YAML)
+python3 vol_move_exec.py --plans-dir ./plans/ --username admin
+
+# Dry-run: log what would happen (no ONTAP changes)
+python3 vol_move_exec.py --plans-dir ./plans/ --username admin --dry-run
+
+# Lower concurrency (default 6)
+python3 vol_move_exec.py --plans-dir ./plans/ --username admin \
+  --max-concurrent 3
+```
+
+#### Behaviour
+
+On each run (e.g., every 30 minutes via cron):
+
+1. **Reads** YAML plan file(s)
+   - Single mode: `--plan <file> --cluster <host>`
+   - Directory mode: `--plans-dir <dir>` (defaults to `./plans/`; reads cluster from YAML)
+
+2. **For each plan:**
+   - **Refreshes** in-flight volume move statuses by querying ONTAP
+     `movement.state` REST endpoint
+   - Any `in_progress` move that has completed is marked `done` or `failed`
+
+3. **Starts** pending moves:
+   - Counts currently `in_progress` moves cluster-wide (including external moves)
+   - Starts up to `--max-concurrent` pending moves (default 6) per cluster
+   - Runs ONTAP `PATCH /api/storage/volumes/{uuid}` with
+     `movement.destination_aggregate` set
+
+4. **Updates YAML** with new statuses and writes back to disk
+   - Status never reverts (e.g., `done` stays `done`)
+   - Sets `error` field if move fails
+
+5. **Prints** per-plan summary:
+   ```
+   Plan: plans/10.0.0.1_vs_prod.yaml
+   ├─ Cluster: 10.0.0.1 / SVM: vs_prod
+   ├─ Pending: 2 | In Progress: 1 | Done: 3 | Failed: 0
+   └─ Started this run: 2
+
+   Combined (all plans):
+   ├─ Pending: 5 | In Progress: 3 | Done: 8 | Failed: 1
+   ```
+
+#### Status Lifecycle
+
+```
+pending  ─(start move)→  in_progress  ─(query state)→  done
+                                                 └→  failed
+```
+
+- `pending`: Awaiting execution (initial state from `vol_schedule.py`)
+- `in_progress`: Move operation started; ONTAP is moving the volume
+- `done`: Move completed successfully (queried from ONTAP)
+- `failed`: Move failed or aborted (queried from ONTAP, `error` field populated)
+
+#### Idempotency & Cron Safety
+
+The script is **fully idempotent**:
+- If a volume's move is already `in_progress`, it is not restarted
+- If a volume is already `done`, it is skipped
+- No operation is repeated on subsequent runs
+
+**Prevent overlapping executions** with `flock`:
+
+```bash
+# crontab entry (every 30 minutes)
+*/30 * * * * flock -n /tmp/vol_move_exec.lock \
+  python3 /path/to/vol_move_exec.py --plans-dir ./plans/ \
+  --username admin >> /var/log/vol_move_exec_cron.log 2>&1
+```
+
+If the script is already running, `flock -n` will exit immediately without queuing.
+
+#### Logs
+
+- Timestamped log file: `logs/vol_move_exec_<YYYYMMDD_HHMMSS>.log`
+- Status refreshes, move initiations, and per-plan summaries are logged
+
+#### CLI Arguments
+
+| Argument | Mode | Default | Description |
+|---|---|---|---|
+| `--plan` | single | — | Single YAML plan file path |
+| `--cluster` | single | — | Cluster IP/hostname (for `--plan` mode only) |
+| `--username` | both | ✅ | Admin username |
+| `--password` | both | `$ONTAP_PASSWORD` | Admin password |
+| `--plans-dir` | directory | `./plans/` | Directory of plan files (reads cluster from each) |
+| `--max-concurrent` | both | `6` | Max simultaneous volume move operations per cluster |
+| `--dry-run` | both | `false` | Log planned operations without executing them |
+| `--verify-ssl` | both | `false` | Verify SSL certificates |
+| `--log-dir` | both | `./logs/` | Directory for log files |
+
+---
+
+### YAML Plan Schema
+
+Generated by `vol_schedule.py` and consumed by `vol_move_exec.py`:
+
+```yaml
+cluster: "10.0.0.1"
+svm: "vs_prod"
+volumes:
+  - name: "vol_data_01"
+    uuid: "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+    target_aggregate: "aggr2_node1"
+    status: "pending"           # pending | in_progress | done | failed
+    error: null                 # null or error message from ONTAP
+  - name: "vol_data_02"
+    uuid: "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+    target_aggregate: "aggr1_node2"
+    status: "in_progress"
+    error: null
+  - name: "vol_archive"
+    uuid: "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
+    target_aggregate: "aggr3_node1"
+    status: "done"
+    error: null
+```
+
+#### Workflow Example: Three Clusters
+
+1. **Plan** — on three separate clusters:
+   ```bash
+   # Cluster A
+   vol_schedule.py --cluster clusterA.local --svm vs_prod
+   # → plans/clusterA.local_vs_prod.yaml (pending volumes)
+
+   # Cluster B
+   vol_schedule.py --cluster clusterB.local --svm vs_data
+   # → plans/clusterB.local_vs_data.yaml (pending volumes)
+
+   # Cluster C
+   vol_schedule.py --cluster clusterC.local --svm vs_app
+   # → plans/clusterC.local_vs_app.yaml (pending volumes)
+   ```
+
+2. **Execute** — centralized cron job:
+   ```bash
+   # Every 30 min: reads all three plans, refreshes status, starts moves
+   */30 * * * * flock -n /tmp/vol_move_exec.lock \
+     python3 vol_move_exec.py --plans-dir ./plans/ --username admin
+   ```
+
+3. **Monitor** — check logs or re-run vol_move_exec.py anytime:
+   ```bash
+   # View current status across all plans
+   python3 vol_move_exec.py --plans-dir ./plans/ --username admin
+   # (Queries each cluster, prints summary, no changes if all are done)
+   ```
+
+---
 
 ## Architecture
 

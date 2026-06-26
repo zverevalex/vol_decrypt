@@ -1303,6 +1303,745 @@ class TestRunCutoverVolumeSelection(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# vol_schedule — imports
+# ---------------------------------------------------------------------------
+
+
+class TestVolScheduleImports(unittest.TestCase):
+    """Verify that vol_schedule imports without errors."""
+
+    def test_vol_schedule_imports(self) -> None:
+        """vol_schedule module must be importable."""
+        import vol_schedule  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# vol_move_exec — imports
+# ---------------------------------------------------------------------------
+
+
+class TestVolMoveExecImports(unittest.TestCase):
+    """Verify that vol_move_exec imports without errors."""
+
+    def test_vol_move_exec_imports(self) -> None:
+        """vol_move_exec module must be importable."""
+        import vol_move_exec  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# vol_schedule — build_plan_entry
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPlanEntry(unittest.TestCase):
+    """Unit tests for vol_schedule.build_plan_entry()."""
+
+    def _make_vol(self) -> dict[str, object]:
+        return {
+            "name": "vol_data_01",
+            "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "svm": "vs_prod",
+            "size": 107374182400,
+            "space_used": 48318382080,
+            "current_aggr": "aggr1_node1",
+        }
+
+    def test_returns_pending_status(self) -> None:
+        """build_plan_entry must set status to 'pending'."""
+        from vol_schedule import build_plan_entry
+
+        entry = build_plan_entry(self._make_vol(), "aggr2_node2")
+        self.assertEqual(entry["status"], "pending")
+
+    def test_error_is_none(self) -> None:
+        """build_plan_entry must set error to None."""
+        from vol_schedule import build_plan_entry
+
+        entry = build_plan_entry(self._make_vol(), "aggr2_node2")
+        self.assertIsNone(entry["error"])
+
+    def test_correct_target_aggregate(self) -> None:
+        """build_plan_entry must record the supplied target aggregate."""
+        from vol_schedule import build_plan_entry
+
+        entry = build_plan_entry(self._make_vol(), "aggr2_node2")
+        self.assertEqual(entry["target_aggregate"], "aggr2_node2")
+
+    def test_name_and_uuid_propagated(self) -> None:
+        """build_plan_entry must copy name and uuid from the volume dict."""
+        from vol_schedule import build_plan_entry
+
+        vol = self._make_vol()
+        entry = build_plan_entry(vol, "aggr2_node2")
+        self.assertEqual(entry["name"], vol["name"])
+        self.assertEqual(entry["uuid"], vol["uuid"])
+
+    def test_required_keys_present(self) -> None:
+        """build_plan_entry must return a dict with all required keys."""
+        from vol_schedule import build_plan_entry
+
+        entry = build_plan_entry(self._make_vol(), "aggr2_node2")
+        for key in ("name", "uuid", "target_aggregate", "status", "error"):
+            self.assertIn(key, entry)
+
+
+# ---------------------------------------------------------------------------
+# vol_schedule — format_volume_table
+# ---------------------------------------------------------------------------
+
+
+class TestFormatVolumeTable(unittest.TestCase):
+    """Unit tests for vol_schedule.format_volume_table()."""
+
+    def _make_volumes(self) -> list[dict[str, object]]:
+        return [
+            {
+                "name": "vol_sales",
+                "uuid": "uuid-1",
+                "svm": "vs_prod",
+                "size": 107374182400,
+                "space_used": 53687091200,
+                "current_aggr": "aggr1_node1",
+            },
+            {
+                "name": "vol_finance",
+                "uuid": "uuid-2",
+                "svm": "vs_prod",
+                "size": 214748364800,
+                "space_used": 32212254720,
+                "current_aggr": "aggr2_node2",
+            },
+        ]
+
+    def test_returns_non_empty_string(self) -> None:
+        """format_volume_table must return a non-empty string."""
+        from vol_schedule import format_volume_table
+
+        result = format_volume_table(self._make_volumes())
+        self.assertIsInstance(result, str)
+        self.assertTrue(result)
+
+    def test_contains_volume_name(self) -> None:
+        """format_volume_table must include each volume name in the output."""
+        from vol_schedule import format_volume_table
+
+        result = format_volume_table(self._make_volumes())
+        self.assertIn("vol_sales", result)
+        self.assertIn("vol_finance", result)
+
+    def test_contains_aggregate_name(self) -> None:
+        """format_volume_table must include current aggregate names."""
+        from vol_schedule import format_volume_table
+
+        result = format_volume_table(self._make_volumes())
+        self.assertIn("aggr1_node1", result)
+
+    def test_row_count_matches_volumes(self) -> None:
+        """format_volume_table must produce one data row per volume."""
+        from vol_schedule import format_volume_table
+
+        result = format_volume_table(self._make_volumes())
+        # Header + separator = 2 lines; remaining are data rows
+        lines = [ln for ln in result.splitlines() if ln.strip()]
+        data_rows = [ln for ln in lines[2:] if ln.strip()]
+        self.assertEqual(len(data_rows), len(self._make_volumes()))
+
+    def test_empty_list_returns_header_only(self) -> None:
+        """format_volume_table with an empty list must still return a header."""
+        from vol_schedule import format_volume_table
+
+        result = format_volume_table([])
+        self.assertIn("Name", result)
+
+
+# ---------------------------------------------------------------------------
+# vol_move_exec — load_plan
+# ---------------------------------------------------------------------------
+
+
+class TestLoadPlan(unittest.TestCase):
+    """Unit tests for vol_move_exec.load_plan()."""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmpdir = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        import shutil
+
+        shutil.rmtree(str(self._tmpdir), ignore_errors=True)
+
+    def _write(self, content: str) -> Path:
+        p = self._tmpdir / "plan.yaml"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    _VALID_YAML = """\
+cluster: "cluster1.example.com"
+svm: "vs_prod"
+volumes:
+  - name: "vol_data_01"
+    uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    target_aggregate: "aggr1_node1"
+    status: "pending"
+    error: null
+"""
+
+    def test_valid_plan_returns_dict_with_volumes(self) -> None:
+        """load_plan with a well-formed YAML file must return a dict."""
+        from vol_move_exec import load_plan
+
+        plan = load_plan(self._write(self._VALID_YAML))
+        self.assertIn("volumes", plan)
+        self.assertEqual(len(plan["volumes"]), 1)
+
+    def test_valid_plan_cluster_preserved(self) -> None:
+        """load_plan must preserve the cluster key value."""
+        from vol_move_exec import load_plan
+
+        plan = load_plan(self._write(self._VALID_YAML))
+        self.assertEqual(plan["cluster"], "cluster1.example.com")
+
+    def test_missing_cluster_raises_value_error(self) -> None:
+        """load_plan must raise ValueError when 'cluster' key is absent."""
+        from vol_move_exec import load_plan
+
+        yaml_no_cluster = "svm: vs_prod\nvolumes: []\n"
+        with self.assertRaises(ValueError) as ctx:
+            load_plan(self._write(yaml_no_cluster))
+        self.assertIn("cluster", str(ctx.exception))
+
+    def test_missing_svm_raises_value_error(self) -> None:
+        """load_plan must raise ValueError when 'svm' key is absent."""
+        from vol_move_exec import load_plan
+
+        yaml_no_svm = "cluster: c1\nvolumes: []\n"
+        with self.assertRaises(ValueError):
+            load_plan(self._write(yaml_no_svm))
+
+    def test_missing_entry_key_raises_value_error(self) -> None:
+        """load_plan must raise ValueError when a volume entry lacks a required key."""
+        from vol_move_exec import load_plan
+
+        yaml_bad_entry = """\
+cluster: "c1"
+svm: "vs_prod"
+volumes:
+  - name: "vol1"
+    uuid: "xxx"
+    target_aggregate: "aggr1"
+"""
+        with self.assertRaises(ValueError) as ctx:
+            load_plan(self._write(yaml_bad_entry))
+        self.assertIn("status", str(ctx.exception))
+
+    def test_missing_file_raises_file_not_found(self) -> None:
+        """load_plan must raise FileNotFoundError for a non-existent path."""
+        from vol_move_exec import load_plan
+
+        with self.assertRaises(FileNotFoundError):
+            load_plan(self._tmpdir / "does_not_exist.yaml")
+
+
+# ---------------------------------------------------------------------------
+# vol_move_exec — update_in_progress_statuses
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateInProgressStatuses(unittest.TestCase):
+    """Unit tests for vol_move_exec.update_in_progress_statuses()."""
+
+    def _make_entry(self, status: str = "in_progress") -> dict[str, object]:
+        return {
+            "name": "vol_data_01",
+            "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "target_aggregate": "aggr2_node2",
+            "status": status,
+            "error": None,
+        }
+
+    def test_no_movement_transitions_to_done(self) -> None:
+        """in_progress entry with no movement attribute must transition to done."""
+        from vol_move_exec import update_in_progress_statuses
+
+        entries = [self._make_entry("in_progress")]
+        mock_vol_instance = MagicMock()
+        mock_vol_instance.movement = None  # SDK returns no movement object
+
+        with patch("netapp_ontap.resources.Volume", return_value=mock_vol_instance):
+            update_in_progress_statuses(entries)
+
+        self.assertEqual(entries[0]["status"], "done")
+
+    def test_active_state_stays_in_progress(self) -> None:
+        """in_progress entry with an active movement state must stay in_progress."""
+        from vol_move_exec import update_in_progress_statuses
+
+        entries = [self._make_entry("in_progress")]
+        mock_movement = MagicMock()
+        mock_movement.state = "replicating"
+        mock_vol_instance = MagicMock()
+        mock_vol_instance.movement = mock_movement
+
+        with patch("netapp_ontap.resources.Volume", return_value=mock_vol_instance):
+            update_in_progress_statuses(entries)
+
+        self.assertEqual(entries[0]["status"], "in_progress")
+
+    def test_failed_state_transitions_to_failed(self) -> None:
+        """in_progress entry with movement.state == 'failed' must become failed."""
+        from vol_move_exec import update_in_progress_statuses
+
+        entries = [self._make_entry("in_progress")]
+        mock_movement = MagicMock()
+        mock_movement.state = "failed"
+        mock_vol_instance = MagicMock()
+        mock_vol_instance.movement = mock_movement
+
+        with patch("netapp_ontap.resources.Volume", return_value=mock_vol_instance):
+            update_in_progress_statuses(entries)
+
+        self.assertEqual(entries[0]["status"], "failed")
+
+    def test_pending_entry_is_not_touched(self) -> None:
+        """update_in_progress_statuses must not modify non-in_progress entries."""
+        from vol_move_exec import update_in_progress_statuses
+
+        entries = [self._make_entry("pending")]
+
+        with patch("netapp_ontap.resources.Volume") as mock_vol_cls:
+            update_in_progress_statuses(entries)
+            mock_vol_cls.assert_not_called()
+
+        self.assertEqual(entries[0]["status"], "pending")
+
+    def test_get_error_logged_and_entry_unchanged(self) -> None:
+        """NetAppRestError during .get() must be logged; status must not change."""
+        from vol_move_exec import update_in_progress_statuses
+
+        entries = [self._make_entry("in_progress")]
+        mock_vol_instance = MagicMock()
+
+        # Patch NetAppRestError in the module to plain Exception for this test
+        with (
+            patch("netapp_ontap.resources.Volume", return_value=mock_vol_instance),
+            patch("netapp_ontap.error.NetAppRestError", Exception),
+        ):
+            mock_vol_instance.get.side_effect = Exception("simulated REST error")
+            update_in_progress_statuses(entries)
+
+        self.assertEqual(entries[0]["status"], "in_progress")
+
+
+# ---------------------------------------------------------------------------
+# vol_move_exec — start_pending_moves
+# ---------------------------------------------------------------------------
+
+
+class TestStartPendingMoves(unittest.TestCase):
+    """Unit tests for vol_move_exec.start_pending_moves()."""
+
+    def _make_entry(self, status: str = "pending") -> dict[str, object]:
+        return {
+            "name": "vol_data_01",
+            "uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "target_aggregate": "aggr2_node2",
+            "status": status,
+            "error": None,
+        }
+
+    def _aggr_map(self) -> dict[str, object]:
+        return {"aggr2_node2": {"node_name": "node-01"}}
+
+    def test_successful_patch_transitions_to_in_progress(self) -> None:
+        """pending entry must become in_progress when Volume.patch succeeds."""
+        from vol_move_exec import start_pending_moves
+
+        entries = [self._make_entry("pending")]
+        mock_vol_instance = MagicMock()
+        node_counts: dict[str, int] = {}
+
+        with (
+            patch("netapp_ontap.resources.Volume", return_value=mock_vol_instance),
+            patch("vol_move_exec.get_volume_source_node", return_value="node-01"),
+        ):
+            started = start_pending_moves(
+                entries, svm="vs_prod", aggr_map=self._aggr_map(),
+                node_move_counts=node_counts, max_per_node=8,
+            )
+
+        self.assertEqual(entries[0]["status"], "in_progress")
+        self.assertEqual(started, 1)
+        self.assertEqual(node_counts.get("node-01"), 1)
+
+    def test_failed_patch_transitions_to_failed(self) -> None:
+        """pending entry must become failed when Volume.patch raises NetAppRestError."""
+        from vol_move_exec import start_pending_moves
+
+        entries = [self._make_entry("pending")]
+        mock_vol_instance = MagicMock()
+        mock_vol_instance.patch.side_effect = Exception("ONTAP REST failure")
+        node_counts: dict[str, int] = {}
+
+        with (
+            patch("netapp_ontap.resources.Volume", return_value=mock_vol_instance),
+            patch("netapp_ontap.error.NetAppRestError", Exception),
+            patch("vol_move_exec.get_volume_source_node", return_value="node-01"),
+        ):
+            started = start_pending_moves(
+                entries, svm="vs_prod", aggr_map=self._aggr_map(),
+                node_move_counts=node_counts, max_per_node=8,
+            )
+
+        self.assertEqual(entries[0]["status"], "failed")
+        self.assertIn("ONTAP REST failure", str(entries[0]["error"]))
+        self.assertEqual(started, 0)
+
+    def test_zero_slots_starts_nothing(self) -> None:
+        """All slots occupied on the source node must prevent any new move."""
+        from vol_move_exec import start_pending_moves
+
+        entries = [self._make_entry("pending")]
+        # Node already at capacity
+        node_counts: dict[str, int] = {"node-01": 8}
+
+        with (
+            patch("netapp_ontap.resources.Volume") as mock_vol_cls,
+            patch("vol_move_exec.get_volume_source_node", return_value="node-01"),
+        ):
+            started = start_pending_moves(
+                entries, svm="vs_prod", aggr_map=self._aggr_map(),
+                node_move_counts=node_counts, max_per_node=8,
+            )
+            mock_vol_cls.assert_not_called()
+
+        self.assertEqual(entries[0]["status"], "pending")
+        self.assertEqual(started, 0)
+
+    def test_dry_run_does_not_call_patch(self) -> None:
+        """dry_run=True must not call Volume.patch and must not change status."""
+        from vol_move_exec import start_pending_moves
+
+        entries = [self._make_entry("pending")]
+        mock_vol_instance = MagicMock()
+        node_counts: dict[str, int] = {}
+
+        with patch("netapp_ontap.resources.Volume", return_value=mock_vol_instance):
+            started = start_pending_moves(
+                entries, svm="vs_prod", aggr_map=self._aggr_map(),
+                node_move_counts=node_counts, max_per_node=8, dry_run=True,
+            )
+            mock_vol_instance.patch.assert_not_called()
+
+        self.assertEqual(entries[0]["status"], "pending")
+        self.assertEqual(started, 1)
+
+    def test_respects_per_node_slot_limit(self) -> None:
+        """Volumes beyond max_per_node on the same source node must be skipped."""
+        from vol_move_exec import start_pending_moves
+
+        entries = [self._make_entry("pending") for _ in range(5)]
+        mock_vol_instance = MagicMock()
+        node_counts: dict[str, int] = {"node-01": 6}  # 6 already in flight, limit 8
+
+        with (
+            patch("netapp_ontap.resources.Volume", return_value=mock_vol_instance),
+            patch("vol_move_exec.get_volume_source_node", return_value="node-01"),
+        ):
+            started = start_pending_moves(
+                entries, svm="vs_prod", aggr_map=self._aggr_map(),
+                node_move_counts=node_counts, max_per_node=8,
+            )
+
+        self.assertEqual(started, 2)  # only 2 free slots (8 - 6)
+        in_progress = sum(1 for e in entries if e["status"] == "in_progress")
+        self.assertEqual(in_progress, 2)
+
+    def test_skips_non_pending_entries(self) -> None:
+        """start_pending_moves must skip entries that are not pending."""
+        from vol_move_exec import start_pending_moves
+
+        entries = [
+            self._make_entry("done"),
+            self._make_entry("in_progress"),
+            self._make_entry("pending"),
+        ]
+        mock_vol_instance = MagicMock()
+        node_counts: dict[str, int] = {}
+
+        with (
+            patch("netapp_ontap.resources.Volume", return_value=mock_vol_instance),
+            patch("vol_move_exec.get_volume_source_node", return_value="node-01"),
+        ):
+            started = start_pending_moves(
+                entries, svm="vs_prod", aggr_map=self._aggr_map(),
+                node_move_counts=node_counts, max_per_node=8,
+            )
+
+        self.assertEqual(started, 1)
+        self.assertEqual(entries[0]["status"], "done")
+        self.assertEqual(entries[1]["status"], "in_progress")
+        self.assertEqual(entries[2]["status"], "in_progress")
+
+
+# ---------------------------------------------------------------------------
+# vol_schedule — format_aggregate_table (extended)
+# ---------------------------------------------------------------------------
+
+
+class TestFormatAggregateTable(unittest.TestCase):
+    """Unit tests for vol_schedule.format_aggregate_table()."""
+
+    def _make_aggr(
+        self,
+        name: str = "aggr1",
+        node: str = "node-01",
+        total: int = 4 * 1024 ** 3,
+        used: int = 1 * 1024 ** 3,
+        create_time: str | None = "2025-01-15T10:00:00Z",
+    ) -> dict[str, object]:
+        available = total - used
+        return {
+            "name": name,
+            "node_name": node,
+            "total": total,
+            "used": used,
+            "available": available,
+            "usage_pct": round(used / total * 100, 1),
+            "create_time": create_time,
+        }
+
+    def test_returns_non_empty_string(self) -> None:
+        """format_aggregate_table must return a non-empty string."""
+        from vol_schedule import format_aggregate_table
+
+        result = format_aggregate_table([self._make_aggr()])
+        self.assertIsInstance(result, str)
+        self.assertTrue(len(result) > 0)
+
+    def test_contains_aggregate_name(self) -> None:
+        """Aggregate name must appear in the table."""
+        from vol_schedule import format_aggregate_table
+
+        result = format_aggregate_table([self._make_aggr(name="aggr_prod")])
+        self.assertIn("aggr_prod", result)
+
+    def test_contains_created_date(self) -> None:
+        """Created date (YYYY-MM-DD) must appear in the table."""
+        from vol_schedule import format_aggregate_table
+
+        result = format_aggregate_table([self._make_aggr(create_time="2025-03-21T08:00:00Z")])
+        self.assertIn("2025-03-21", result)
+
+    def test_unknown_when_no_create_time(self) -> None:
+        """Aggregates without create_time must show 'unknown' in Created column."""
+        from vol_schedule import format_aggregate_table
+
+        result = format_aggregate_table([self._make_aggr(create_time=None)])
+        self.assertIn("unknown", result)
+
+    def test_planned_bytes_adjusts_capacity(self) -> None:
+        """planned_bytes must reduce Free and increase Used in the table."""
+        from vol_schedule import format_aggregate_table
+
+        aggr = self._make_aggr(name="aggr2", total=10 * 1024 ** 3, used=2 * 1024 ** 3)
+        planned = {"aggr2": 1 * 1024 ** 3}
+        result = format_aggregate_table([aggr], planned_bytes=planned)
+        # Effective used = 3 GiB, shown in Used(GiB) column
+        self.assertIn("3.00", result)
+
+    def test_planned_bytes_adds_asterisk_marker(self) -> None:
+        """Aggregates with planned bytes must have a '*' usage marker."""
+        from vol_schedule import format_aggregate_table
+
+        aggr = self._make_aggr(name="aggr2")
+        result = format_aggregate_table([aggr], planned_bytes={"aggr2": 512 * 1024 ** 2})
+        self.assertIn("*", result)
+        self.assertIn("(* capacity adjusted", result)
+
+    def test_no_planned_bytes_no_asterisk(self) -> None:
+        """Without planned bytes no '*' marker or footnote should appear."""
+        from vol_schedule import format_aggregate_table
+
+        result = format_aggregate_table([self._make_aggr()])
+        self.assertNotIn("*", result)
+
+    def test_sorted_newest_first(self) -> None:
+        """Aggregates must be sorted newest create_time first."""
+        from vol_schedule import format_aggregate_table
+
+        old = self._make_aggr(name="aggr_old", create_time="2020-01-01T00:00:00Z")
+        new = self._make_aggr(name="aggr_new", create_time="2025-06-01T00:00:00Z")
+        result = format_aggregate_table([old, new])
+        self.assertLess(result.index("aggr_new"), result.index("aggr_old"))
+
+    def test_empty_list_returns_header_only(self) -> None:
+        """Empty aggregate list must return the header row and separator only."""
+        from vol_schedule import format_aggregate_table
+
+        result = format_aggregate_table([])
+        self.assertIn("Aggregate", result)
+        self.assertIn("Created", result)
+        lines = result.splitlines()
+        self.assertEqual(len(lines), 2)  # header + separator
+
+
+# ---------------------------------------------------------------------------
+# vol_schedule — get_volumes_on_aggregate
+# ---------------------------------------------------------------------------
+
+
+class TestGetVolumesOnAggregate(unittest.TestCase):
+    """Unit tests for vol_schedule.get_volumes_on_aggregate()."""
+
+    def _make_mock_vol(
+        self,
+        name: str = "vol_data",
+        uuid: str = "uuid-01",
+        size: int = 1024 ** 3,
+        used: int = 512 * 1024 ** 2,
+        aggr_name: str = "aggr1",
+        svm_name: str = "vs_prod",
+        move_state: str | None = None,
+    ) -> MagicMock:
+        vol = MagicMock()
+        vol.name = name
+        vol.uuid = uuid
+        vol.size = size
+        aggr_mock = MagicMock()
+        aggr_mock.name = aggr_name
+        vol.aggregates = [aggr_mock]
+        vol.svm = MagicMock()
+        vol.svm.name = svm_name
+        space = MagicMock()
+        space.used = used
+        vol.space = space
+        if move_state:
+            movement = MagicMock()
+            movement.state = move_state
+            vol.movement = movement
+        else:
+            vol.movement = None
+        return vol
+
+    def test_returns_volumes_on_aggregate(self) -> None:
+        """Eligible volumes on the aggregate must be returned."""
+        from vol_schedule import get_volumes_on_aggregate
+
+        mock_vol = self._make_mock_vol()
+        with patch(
+            "netapp_ontap.resources.Volume.get_collection", return_value=[mock_vol]
+        ):
+            mock_vol.get = MagicMock()
+            result = get_volumes_on_aggregate("vs_prod", "aggr1")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["name"], "vol_data")
+        self.assertEqual(result[0]["current_aggr"], "aggr1")
+
+    def test_skips_root_volumes(self) -> None:
+        """Root volumes (name ends with _root or equals vol0) must be skipped."""
+        from vol_schedule import get_volumes_on_aggregate
+
+        root_vol = self._make_mock_vol(name="svm_root")
+        vol0 = self._make_mock_vol(name="vol0", uuid="uuid-02")
+        with patch(
+            "netapp_ontap.resources.Volume.get_collection",
+            return_value=[root_vol, vol0],
+        ):
+            root_vol.get = MagicMock()
+            vol0.get = MagicMock()
+            result = get_volumes_on_aggregate("vs_prod", "aggr1")
+
+        self.assertEqual(result, [])
+
+    def test_skips_in_flight_volumes(self) -> None:
+        """Volumes already in an active move must be skipped."""
+        from vol_schedule import get_volumes_on_aggregate
+
+        moving_vol = self._make_mock_vol(name="vol_moving", move_state="replicating")
+        with patch(
+            "netapp_ontap.resources.Volume.get_collection", return_value=[moving_vol]
+        ):
+            moving_vol.get = MagicMock()
+            result = get_volumes_on_aggregate("vs_prod", "aggr1")
+
+        self.assertEqual(result, [])
+
+
+# ---------------------------------------------------------------------------
+# vol_schedule — prompt_pick_aggregate
+# ---------------------------------------------------------------------------
+
+
+class TestPromptPickAggregate(unittest.TestCase):
+    """Unit tests for vol_schedule.prompt_pick_aggregate()."""
+
+    def _make_aggr(self, name: str) -> dict[str, str]:
+        return {"name": name, "node_name": "node-01"}
+
+    def test_valid_selection_returns_correct_aggregate(self) -> None:
+        """A valid number must return the matching aggregate dict."""
+        from vol_schedule import prompt_pick_aggregate
+
+        aggrs = [self._make_aggr("aggr1"), self._make_aggr("aggr2")]
+        with patch("builtins.input", return_value="2"):
+            result = prompt_pick_aggregate(aggrs, "Pick: ")
+        self.assertEqual(result["name"], "aggr2")
+
+    def test_invalid_then_valid_input(self) -> None:
+        """Non-numeric and out-of-range input must re-prompt until valid."""
+        from vol_schedule import prompt_pick_aggregate
+
+        aggrs = [self._make_aggr("aggr1")]
+        with patch("builtins.input", side_effect=["abc", "0", "1"]):
+            result = prompt_pick_aggregate(aggrs, "Pick: ")
+        self.assertEqual(result["name"], "aggr1")
+
+
+# ---------------------------------------------------------------------------
+# vol_move_exec — _compute_plan_status
+# ---------------------------------------------------------------------------
+
+
+class TestComputePlanStatus(unittest.TestCase):
+    """Unit tests for vol_move_exec._compute_plan_status()."""
+
+    def test_all_done_returns_done(self) -> None:
+        """All done entries must return 'done'."""
+        from vol_move_exec import _compute_plan_status
+
+        entries = [{"status": "done"}, {"status": "done"}]
+        self.assertEqual(_compute_plan_status(entries), "done")
+
+    def test_all_pending_returns_pending(self) -> None:
+        """All pending entries must return 'pending'."""
+        from vol_move_exec import _compute_plan_status
+
+        entries = [{"status": "pending"}, {"status": "pending"}]
+        self.assertEqual(_compute_plan_status(entries), "pending")
+
+    def test_mixed_returns_in_progress(self) -> None:
+        """Mixed statuses with at least one pending/in_progress must return 'in_progress'."""
+        from vol_move_exec import _compute_plan_status
+
+        entries = [
+            {"status": "done"},
+            {"status": "pending"},
+            {"status": "in_progress"},
+        ]
+        self.assertEqual(_compute_plan_status(entries), "in_progress")
+
+    def test_all_failed_returns_failed(self) -> None:
+        """All failed entries (no pending/in_progress) must return 'failed'."""
+        from vol_move_exec import _compute_plan_status
+
+        entries = [{"status": "failed"}, {"status": "failed"}]
+        self.assertEqual(_compute_plan_status(entries), "failed")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
